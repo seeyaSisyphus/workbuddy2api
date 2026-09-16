@@ -127,7 +127,7 @@ flowchart LR
 ### Docker Compose 一键部署
 
 ```bash
-git clone https://github.com/Sliverkiss/workbuddy2api.git
+git clone https://github.com/seeyaSisyphus/workbuddy2api.git
 cd workbuddy2api
 cp config.example.json config.json
 ```
@@ -261,3 +261,14 @@ curl -s http://localhost:7863/v1/chat/completions \
 - 再分发（源码或二进制形式）时，须保留原仓库的 MIT 版权声明与许可声明，并在 NOTICE 或 README 中注明原始出处 `https://github.com/Sliverkiss/workbuddy2api`
 - 本项目不授予任何上游（CodeBuddy）接口或服务的权利；使用者仍需自行遵守上游服务条款
 - 本项目的使用同时受上方**免责声明**约束；如免责声明与 MIT License 存在不一致，以免责声明为准
+
+### 本仓库（fork）说明
+
+本仓库是 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的二次开发分支，以上游 `master` 为基线并重新叠加以下自有能力（上游未提供）：
+
+- `features.reasoning_alias` — 响应/流附等值 `reasoning` 别名字段，兼容只认 OpenRouter 风格单字段的客户端
+- `schedule.checkin_window` / `schedule.checkin_jitter` — 每日窗口内按日期派生的稳定随机时刻签到，账号间错开
+- `schedule.credit_refresh` — 后台定期刷新全账号余额与快过期额度
+- `internal/history` — 积分快照 JSONL，供积分日报计算当日消耗
+
+上游原始著作权归原作者所有；本仓库的修改部分 © 2026 seeyaSisyphus。

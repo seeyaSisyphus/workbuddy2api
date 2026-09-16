@@ -729,7 +729,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
 			stats := newChatStatsReaderSince(rc, st.start)
-			_ = upstream.Stream(w, stats)
+			_ = upstream.Stream(w, stats, h.cfg.Upstream.ReasoningAlias)
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
 			// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价，
@@ -744,7 +744,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			rc.Close()
 			return
 		}
-		resp, err := upstream.Aggregate(rc)
+		resp, err := upstream.Aggregate(rc, h.cfg.Upstream.ReasoningAlias)
 		rc.Close()
 		if err != nil {
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。

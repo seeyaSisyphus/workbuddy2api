@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"sync"
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/history"
 	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/upstream"
@@ -32,6 +34,24 @@ type Config struct {
 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
 	// 默认 5 条同一 conversationId 内多轮上报把 chat_5 刷满；0/缺省=1 兼容旧行为。
 	ActivityReportCount int
+
+	// CheckinWindowFrom / CheckinWindowTo 每日随机签到窗口（相对当日 00:00 的偏移）。
+	// CheckinWindowOn 为真时**取代** CheckinHours：每天在 [From,To) 内取一个由日期
+	// 派生的稳定随机时刻签到（见 windowTarget），避免所有部署在同一整点集中打上游。
+	CheckinWindowOn   bool
+	CheckinWindowFrom time.Duration
+	CheckinWindowTo   time.Duration
+	// CheckinJitter 窗口签到时同批账号之间的最大随机错开间隔（0 = 不抖动）。
+	CheckinJitter time.Duration
+
+	// CreditRefresh 定期刷新全账号余额 + 快过期额度的周期；<=0 = 关闭
+	// （只在签到时刷新，行为与引入前一致）。
+	CreditRefresh time.Duration
+
+	// HistoryFile 积分快照 JSONL 落盘路径（空 = 不记录，零改动现状）。
+	// 记录每账号一次余额观测（签到 kind=checkin / 刷新 kind=probe），
+	// 供 cmd/credit 计算「今日消耗」与历史基线（见 internal/history）。
+	HistoryFile string
 
 	// ExpiringSoonWindow 快过期积分窗口：签到查余额时，把到期时间 <= now+window 的
 	// 套餐余额标记为"快过期"（pool 据此优先消耗，见 entry.creditsExpiring）。
@@ -140,6 +160,34 @@ func nextFire(now time.Time, hours []int) time.Time {
 	return earliest
 }
 
+// seedTime 把自然日折算成一个稳定的整数种子（YYYYMMDD 形式）。
+// 窗口时刻由「日期 → 种子 → 窗口内偏移」派生，因此同一天内多次计算得到同一时刻
+// （进程重启不会改点），跨天自动变化。刻意不引入随机源：签到时刻要可预测、可复现。
+func seedTime(day time.Time) int64 {
+	return int64(day.Year()*10000 + int(day.Month())*100 + day.Day())
+}
+
+// dayTarget 返回指定自然日在签到窗口内的目标时刻：
+// day 的 00:00 + WindowFrom + (种子 % 窗口秒数)。窗口跨零点已由 config 拒绝，
+// 故该时刻必然落在 day 当天内。
+func (s *Scheduler) dayTarget(day time.Time) time.Time {
+	span := int64(s.cfg.CheckinWindowTo-s.cfg.CheckinWindowFrom) / int64(time.Second)
+	// span<=0 属配置层已拒绝的形态；此处兜底为窗口起点，避免取模除零 panic。
+	if span <= 0 {
+		return day.Add(s.cfg.CheckinWindowFrom)
+	}
+	return day.Add(s.cfg.CheckinWindowFrom + time.Duration(seedTime(day)%span)*time.Second)
+}
+
+// windowTarget 返回 now 之后最近的窗口目标时刻：今天窗口未过用今天，否则顺延到明天。
+func (s *Scheduler) windowTarget(now time.Time) time.Time {
+	day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	if tgt := s.dayTarget(day); tgt.After(now) {
+		return tgt
+	}
+	return s.dayTarget(day.Add(24 * time.Hour))
+}
+
 // taskKind 调度任务类型。
 type taskKind int
 
@@ -162,7 +210,12 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	}
 	var slots []slot
 	if !s.cfg.CheckinDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.CheckinHours), taskCheckin})
+		// 窗口模式取代整点排程：每天窗口内一个稳定随机时刻（分散同批部署的上游压力）。
+		if s.cfg.CheckinWindowOn {
+			slots = append(slots, slot{s.windowTarget(now), taskCheckin})
+		} else {
+			slots = append(slots, slot{nextFire(now, s.cfg.CheckinHours), taskCheckin})
+		}
 	}
 	if !s.cfg.TravelDisabled {
 		slots = append(slots, slot{nextFire(now, s.cfg.TravelHours), taskTravel})
@@ -202,6 +255,11 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 
 // Run 主循环，阻塞直到 ctx 取消。
 func (s *Scheduler) Run(ctx context.Context) {
+	// 积分定期刷新独立于六类定时任务：按固定周期跑（与排程时点解耦），
+	// CreditRefresh<=0 时不起这个 goroutine（零改动现状）。
+	if s.cfg.CreditRefresh > 0 {
+		go s.runCreditRefreshLoop(ctx)
+	}
 	for {
 		next, kinds := s.nextWake(time.Now())
 		if next.IsZero() {
@@ -260,19 +318,30 @@ func (s *Scheduler) dispatch(ctx context.Context, k taskKind) {
 }
 
 // RunCheckinNow 定时触发的立即签到：逐账号结果由 CheckinAll 记日志，此处只兜住"撞车跳过"。
+// 定时路径按 CheckinJitter 在账号之间随机错开（见 runCheckin）；手动入口 CheckinAll
+// 不抖动，交互式触发保持即时响应。
 func (s *Scheduler) RunCheckinNow() {
-	if _, err := s.CheckinAll(); err != nil {
+	if _, err := s.runCheckin(context.Background(), s.cfg.CheckinJitter); err != nil {
 		log.Printf("scheduled checkin skipped: %v", err)
 	}
 }
 
-// CheckinAll 全量签到：按需刷新 token → daily-checkin → 查余额 → 解冻冷却账号。
-// 冷却中的账号也参与（签到就是为了解冻它们）；禁用的跳过。
-// 同一时刻只允许一次签到在跑，重复调用返回 ErrBusy（防止手动触发与定时撞车重复打上游）。
+// CheckinAll 全量签到（手动/工具入口）：不抖动，逐账号即时执行。
+// 语义与错开版完全一致，仅省去账号间等待——交互式调用者不该为反突发等待买单。
 //
 // session dead 走 Pool.NoteSessionDead 的**连续计数**语义（与 keepalive 一致）：
 // 一次刷新失败不再立即杀号，连续 sessionDeadThreshold 次才禁用，刷新成功清计数。
 func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
+	return s.runCheckin(context.Background(), 0)
+}
+
+// runCheckin 签到主实现：按需刷新 token → daily-checkin → 查余额 → 解冻冷却账号。
+// 冷却中的账号也参与（签到就是为了解冻它们）；禁用的跳过。
+// 同一时刻只允许一次签到在跑，重复调用返回 ErrBusy（防止手动触发与定时撞车重复打上游）。
+//
+// jitter > 0 时，每个账号打上游前先随机等 [0,jitter)（用 ctx 感知取消，退出时不再空等）——
+// 避免一批账号在同一秒集中打上游触发风控。0 = 不等待（手动入口与测试）。
+func (s *Scheduler) runCheckin(ctx context.Context, jitter time.Duration) ([]CheckinOutcome, error) {
 	if !s.checkinMu.TryLock() {
 		return nil, ErrBusy
 	}
@@ -304,6 +373,13 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 			skipN++
 			out = append(out, oc)
 			continue
+		}
+		// 账号间随机错开：仅定时路径传 jitter>0；ctx 取消时放弃剩余账号。
+		// 放在参与门控之后——被跳过的账号不打上游，不值得消耗抖动预算。
+		if jitter > 0 {
+			if !sleepCtx(ctx, time.Duration(rand.Int64N(int64(jitter)))) {
+				return out, ctx.Err()
+			}
 		}
 		// 停机跨过 token 有效期（关机过夜/容器长期停跑）时先补一次刷新，否则签到必然 401 白跑。
 		if a.NeedsRefresh(checkinRefreshSkew) {
@@ -358,6 +434,8 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 		}
 		s.cfg.Pool.ReenableIfCredits(st.UID, remain)
 		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, buckets.Expiring)
+		// 积分快照：签到后的权威余额（含当日奖励），供日报算当日消耗。
+		s.recordHistory(history.Checkin, st.UID, remain)
 		oc.Credits = &remain
 		switch oc.Status {
 		case CheckinOK:
@@ -380,6 +458,87 @@ func joinDetail(existing, add string) string {
 		return add
 	}
 	return existing + "; " + add
+}
+
+// recordHistory 追加一条积分快照（HistoryFile 为空时不动，零改动现状）。
+// 写失败只记 WARN：历史是观测辅助，绝不能因为磁盘问题影响签到/刷新主流程。
+func (s *Scheduler) recordHistory(kind history.Kind, uid string, remain int64) {
+	if s.cfg.HistoryFile == "" {
+		return
+	}
+	now := time.Now()
+	err := history.Append(s.cfg.HistoryFile, history.Entry{
+		Date:   now.Format("2006-01-02"),
+		TS:     now.Unix(),
+		Kind:   kind,
+		UID:    uid,
+		Remain: remain,
+	})
+	if err != nil {
+		log.Printf("history append %s: %v", logfmt.UID8(uid), err)
+	}
+}
+
+// runCreditRefreshLoop 按 CreditRefresh 周期循环刷新全账号余额，ctx 取消即退出。
+// 启动后先等一个周期再刷新（首轮由 CheckinAll 或进程启动时的余额探测覆盖，
+// 无需立刻重复打上游）；周期 <=0 时本函数不会被调用。
+func (s *Scheduler) runCreditRefreshLoop(ctx context.Context) {
+	t := time.NewTicker(s.cfg.CreditRefresh)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.RunCreditRefreshNow()
+		}
+	}
+}
+
+// RunCreditRefreshNow 立即刷新池内所有账号的余额与快过期额度，回写池供选号使用。
+//
+// 与签到的差别：**不**调 daily-checkin、**不**碰 token（只读余额），因此可以
+// 高频跑；global 账号同样跳过（无 CN 那套 billing 资源口径），禁用/无凭证账号跳过。
+// 单账号失败只记 WARN 不影响其余账号——刷新是尽力而为的观测，不是任务执行。
+func (s *Scheduler) RunCreditRefreshNow() {
+	statuses := s.cfg.Pool.List()
+	var okN, failN, skipN int
+	for _, st := range statuses {
+		if st.Disabled {
+			skipN++
+			continue
+		}
+		a := s.cfg.Pool.AuthByUID(st.UID)
+		if a == nil || a.AccessToken == "" {
+			skipN++
+			continue
+		}
+		// global 账号的余额口径与 CN 不同（无 /v2/billing/meter/get-user-resource
+		// 语义），跳过而非误查；其积分刷新留待签到/手动工具路径。
+		if a.IsGlobal() {
+			skipN++
+			continue
+		}
+		// 余额是只读观测：token 过期时静默跳过（不刷新 token、不算失败），
+		// 刷新 token 是注册/签到路径的职责，避免这里与它们抢写 auths 文件。
+		if a.NeedsRefresh(0) {
+			skipN++
+			continue
+		}
+		remain, buckets, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
+		if err != nil {
+			log.Printf("credit refresh %s: %v", logfmt.UID8(st.UID), err)
+			failN++
+			continue
+		}
+		// 恢复判定放在置数之前：与签到路径同序（ReenableIfCredits 依赖旧余额做迟滞）。
+		s.cfg.Pool.ReenableIfCredits(st.UID, remain)
+		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, buckets.Expiring)
+		// 积分快照：非签到的普通余额探测，供日报回填基线。
+		s.recordHistory(history.Probe, st.UID, remain)
+		okN++
+	}
+	log.Printf("credit refresh done: total=%d ok=%d fail=%d skipped=%d", len(statuses), okN, failN, skipN)
 }
 
 // RunActivityNow 立即对池内所有可用账号执行对话活跃上报。

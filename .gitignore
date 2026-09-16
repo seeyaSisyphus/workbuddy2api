@@ -20,6 +20,15 @@ config.json
 *.tmp
 __pycache__/
 
+# Local server artifacts（本机 Windows 部署：产物/日志/临时联调目录）
+/server.exe
+/wb2api.exe
+/server.out.log
+/server.err.log
+/server.err.log.*
+/.e2e-tmp/
+config.json.bak-*
+
 # Backups (contains auth tokens)
 backups/
 

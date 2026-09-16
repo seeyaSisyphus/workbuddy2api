@@ -55,7 +55,7 @@ data: {"id":"x1","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
 data: [DONE]
 
 `
-	resp, err := Aggregate(strings.NewReader(raw))
+	resp, err := Aggregate(strings.NewReader(raw), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ data: {"id":"x1","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
 data: [DONE]
 
 `
-	resp, err := Aggregate(strings.NewReader(raw))
+	resp, err := Aggregate(strings.NewReader(raw), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +104,7 @@ data: {"id":"x1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]
 data: [DONE]
 
 `
-	resp, err := Aggregate(strings.NewReader(raw))
+	resp, err := Aggregate(strings.NewReader(raw), false)
 	if err != nil {
 		t.Fatal(err)
 	}

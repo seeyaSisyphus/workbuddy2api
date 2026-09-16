@@ -552,6 +552,14 @@ type Client struct {
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	SanitizeFingerprints bool
 
+	// ReasoningAlias 出站响应/流是否附 "reasoning" 别名字段（默认 true）。
+	// 上游 deepseek/glm/kimi 只回 reasoning_content（OpenAI 兼容惯例），而部分客户端
+	// 只认 OpenRouter 风格的单字段 "reasoning"。开启后在两条路径同时补等值别名：
+	//   - 流式：normalizeFrame 对非空 delta.reasoning_content 追加 delta.reasoning；
+	//   - 非流式：Aggregate 在 message 上追加 message.reasoning。
+	// 只增字段、不改 reasoning_content 语义，双字段客户端无感；空思考一律不补。
+	ReasoningAlias bool
+
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认 WorkBuddy
 	// 三段式与 billingUA 单段式）。空 = 默认官方形态：chat/refresh/FetchModels 走
 	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing/checkin 走 `WorkBuddy/<ver>`
@@ -619,6 +627,7 @@ func New() *Client {
 		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
 		SanitizeFingerprints: true,
+		ReasoningAlias:       true, // 默认补 "reasoning" 别名（config reasoning_alias=false 关闭）
 		ChatBaseCN:           "https://copilot.tencent.com",
 		BillingBaseCN:        "https://www.codebuddy.cn",
 	}

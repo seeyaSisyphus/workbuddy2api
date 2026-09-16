@@ -6,7 +6,12 @@
 // 两个命令共用同一份定义，消除漂移源头。
 package config
 
-import "fmt"
+import (
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+)
 
 // Schedule 排程配置段（对应 config.json 的 "schedule" 对象）。
 //
@@ -38,6 +43,31 @@ type Schedule struct {
 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
 	// 默认 5 条把 chat_5 刷满；0/缺省=1 兼容旧行为。
 	ActivityReportCount int `json:"activity_report_count"`
+	// CheckinWindow 每日随机签到窗口 "HH:MM-HH:MM"（如 "08:00-08:30"）。
+	// 非空时**取代** checkin_hours：每天在窗口内取一个由日期派生的稳定随机时刻签到，
+	// 避免所有部署在同一整点集中打上游（风控友好）。跨零点窗口（如 "23:30-00:30"）不支持，
+	// 解析时报错。空 = 走 checkin_hours 整点排程（现状不变）。
+	CheckinWindow string `json:"checkin_window"`
+	// CheckinJitter 窗口签到时同批账号之间的最大随机错开间隔，默认 "60s"。
+	// 账号逐个 sleep 随机秒数后再打上游，进一步打散请求；0 = 不抖动。
+	CheckinJitter string `json:"checkin_jitter"`
+	// CreditRefresh 定期刷新全账号余额 + 快过期额度的周期（如 "10m"）。
+	// 非空且 >0 时启用后台定时刷新：池内已加载账号逐个查余额并回写
+	// （Pool.SetCreditsDetailed），让选号依据的积分与临期额度保持新鲜，
+	// 不必等下一次签到。空/"0" = 关闭（只在签到时刷新，现状不变）。
+	CreditRefresh string `json:"credit_refresh"`
+
+	// 解析后（json:"-"）：由 ParseWindow 填充，供 scheduler 直接使用。
+	//
+	// WindowFromDur/WindowToDur 为窗口起止相对当日 00:00 的偏移；
+	// HasWindow 为真时 scheduler 用窗口排程取代 checkin_hours。
+	WindowFromDur time.Duration `json:"-"`
+	WindowToDur   time.Duration `json:"-"`
+	HasWindow     bool          `json:"-"`
+	// CheckinJitterDur 窗口内同批账号之间的随机错开上限（见 CheckinJitter）。
+	CheckinJitterDur time.Duration `json:"-"`
+	// CreditRefreshDur 生效的积分刷新周期；0 = 关闭。
+	CreditRefreshDur time.Duration `json:"-"`
 	// 猫猫旅行已退役 travel_interval_minutes：旅行现为独立排程（travel_hours）。
 	// 旧 config 里的该键因 JSON 未知字段而自然忽略，不报错。
 }
@@ -131,3 +161,63 @@ func checkHourRange(field, switchKey string, hours []int) error {
 	}
 	return nil
 }
+
+// ParseWindow 解析 checkin_window（"HH:MM-HH:MM"）为当日偏移量并置 HasWindow。
+//
+// 空串 = 不启用窗口（scheduler 继续走 checkin_hours 整点排程）。
+// 非法格式（缺分隔、时刻越界、结束不晚于开始）一律报错——静默忽略会让用户
+// 以为窗口生效、实际仍按整点打上游，属于最难排查的一类配置 bug。
+//
+// 跨零点窗口（如 "23:30-00:30"）显式拒绝：本实现的窗口只落在同一自然日内
+// （见 scheduler.windowTarget），跨零点需要「今天还是明天」的额外判定，
+// 语义易错不如直接不支持，报错提示用户改用不跨零点的窗口。
+func (s *Schedule) ParseWindow() error {
+	w := strings.TrimSpace(s.CheckinWindow)
+	if w == "" {
+		s.HasWindow = false
+		return nil
+	}
+	parts := strings.Split(w, "-")
+	if len(parts) != 2 {
+		return fmt.Errorf("schedule.checkin_window: %q 不是合法窗口（形如 \"08:00-08:30\"）", s.CheckinWindow)
+	}
+	from, err := parseClock(parts[0])
+	if err != nil {
+		return fmt.Errorf("schedule.checkin_window 起始: %w", err)
+	}
+	to, err := parseClock(parts[1])
+	if err != nil {
+		return fmt.Errorf("schedule.checkin_window 结束: %w", err)
+	}
+	if to <= from {
+		return fmt.Errorf("schedule.checkin_window: %q 结束时刻必须晚于起始时刻（不支持跨零点窗口）", s.CheckinWindow)
+	}
+	s.WindowFromDur, s.WindowToDur, s.HasWindow = from, to, true
+	return nil
+}
+
+// parseClock 解析 "HH:MM" 为当日偏移量（00:00 = 0）。接受 "8:00" 这类缺前导零写法。
+func parseClock(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	hm := strings.Split(s, ":")
+	if len(hm) != 2 {
+		return 0, fmt.Errorf("%q 不是合法时刻（形如 \"08:30\"）", s)
+	}
+	h, err := strconv.Atoi(strings.TrimSpace(hm[0]))
+	if err != nil {
+		return 0, fmt.Errorf("%q 小时段不是数字", s)
+	}
+	m, err := strconv.Atoi(strings.TrimSpace(hm[1]))
+	if err != nil {
+		return 0, fmt.Errorf("%q 分钟段不是数字", s)
+	}
+	if h < 0 || h > 23 || m < 0 || m > 59 {
+		return 0, fmt.Errorf("%q 越界（小时 0-23、分钟 0-59）", s)
+	}
+	return time.Duration(h)*time.Hour + time.Duration(m)*time.Minute, nil
+}
+
+// WindowFrom / WindowTo 返回窗口起止相对当日 00:00 的偏移（未启用窗口时为零值）。
+// 单独取用便于测试与日志，语义等同读 WindowFromDur/WindowToDur。
+func (s *Schedule) WindowFrom() time.Duration { return s.WindowFromDur }
+func (s *Schedule) WindowTo() time.Duration   { return s.WindowToDur }

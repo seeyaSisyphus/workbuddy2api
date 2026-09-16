@@ -15,7 +15,10 @@ import (
 // Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
 // 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
-func Aggregate(r io.Reader) (map[string]any, error) {
+//
+// aliasReasoning 为真时，在 message 上追加等值 "reasoning" 别名字段（与 Stream 口径一致），
+// 兼容只认 OpenRouter 风格单字段的客户端。
+func Aggregate(r io.Reader, aliasReasoning bool) (map[string]any, error) {
 	br := bufio.NewReaderSize(r, 64*1024)
 	var (
 		id, model     string
@@ -130,6 +133,10 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 	}
 	if reasoning.Len() > 0 {
 		message["reasoning_content"] = reasoning.String()
+		// 别名字段：与流式 normalizeFrame 同一开关口径，只补非空思考。
+		if aliasReasoning {
+			message["reasoning"] = reasoning.String()
+		}
 	}
 	if len(toolOrder) > 0 {
 		sort.Ints(toolOrder)
@@ -250,7 +257,10 @@ func stripToolCallNames(obj map[string]any, seen map[int]bool) {
 // 剔除上游噪声（finish_reason:"" → null、空 content/refusal、空 tool_calls 列表、
 // 空占位 function_call、顶层未知字段），空 delta 键一律省略，
 // usage 缺失 → null，保证任意标准客户端按规范解析。
-func normalizeFrame(obj map[string]any) map[string]any {
+//
+// aliasReasoning 为真时，delta.reasoning_content 非空即追加等值 delta.reasoning
+// 别名（只认 OpenRouter 风格单字段的客户端可直接消费）；空思考不补。
+func normalizeFrame(obj map[string]any, aliasReasoning bool) map[string]any {
 	out := map[string]any{}
 	for _, k := range []string{"id", "object", "created", "model", "system_fingerprint", "service_tier"} {
 		if v, ok := obj[k]; ok && v != nil {
@@ -284,6 +294,10 @@ func normalizeFrame(obj map[string]any) map[string]any {
 				}
 				if v, ok := d["reasoning_content"].(string); ok && v != "" {
 					delta["reasoning_content"] = v
+					// 别名字段与 reasoning_content 同值同生命周期：仅非空时补。
+					if aliasReasoning {
+						delta["reasoning"] = v
+					}
 				}
 				if v, ok := d["refusal"].(string); ok && v != "" {
 					delta["refusal"] = v
@@ -327,7 +341,9 @@ func normalizeFrame(obj map[string]any) map[string]any {
 // Stream 透传上游 SSE 到 w（逐帧规范化后 flush），保证至少写一个 [DONE]。
 // 调用方必须先设置过 status 200；本函数自设 SSE headers。
 // 流式策略：逐帧透传（规范化已剥空 content 噪声），恢复与上游一致的平滑流式。
-func Stream(w http.ResponseWriter, r io.Reader) error {
+//
+// aliasReasoning 为真时，非空 reasoning_content 帧追加等值 "reasoning" 别名（见 normalizeFrame）。
+func Stream(w http.ResponseWriter, r io.Reader, aliasReasoning bool) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -385,7 +401,7 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 					obj["id"] = firstID
 				}
 			}
-			if raw, err := json.Marshal(normalizeFrame(obj)); err == nil {
+			if raw, err := json.Marshal(normalizeFrame(obj, aliasReasoning)); err == nil {
 				payload = string(raw)
 			}
 			valid = 1

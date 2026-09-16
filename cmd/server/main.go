@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/history"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/redisstore"
 	"workbuddy2api/internal/scheduler"
@@ -102,6 +103,8 @@ func main() {
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
 	up.SanitizeFingerprints = cfg.Features.SanitizeBlacklistFingerprints
+	// 响应/流补 "reasoning" 别名字段（本仓库新增；默认 true）。
+	up.ReasoningAlias = cfg.Features.ReasoningAlias
 	// 出站 UA（A 段）：非空才做显式覆盖，空 = 默认 WorkBuddy 三段式
 	// `WorkBuddy/<client_version> WorkBuddy/<client_version> CLI/<cli_version>`。
 	up.UserAgent = cfg.Upstream.UserAgent
@@ -131,6 +134,13 @@ func main() {
 		CatHours:            cfg.Schedule.CatHours,
 		ActivityReportCount: cfg.Schedule.ActivityReportCount,
 		ExpiringSoonWindow:  cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
+		// 本仓库新增：每日随机签到窗口（取代整点排程）+ 账号间抖动 + 积分定期刷新。
+		CheckinWindowOn:   cfg.Schedule.HasWindow,
+		CheckinWindowFrom: cfg.Schedule.WindowFromDur,
+		CheckinWindowTo:   cfg.Schedule.WindowToDur,
+		CheckinJitter:     cfg.Schedule.CheckinJitterDur,
+		CreditRefresh:     cfg.Schedule.CreditRefreshDur,
+		HistoryFile:       history.DefaultPath(cfg.StateFile), // 积分快照与 state.json 同目录
 		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
 		TravelDisabled:      !cfg.Schedule.TravelEnabled,
 		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,

@@ -71,7 +71,7 @@ const sseFixture = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.ch
 	"data: [DONE]\n\n"
 
 func TestAggregate(t *testing.T) {
-	resp, err := Aggregate(strings.NewReader(sseFixture))
+	resp, err := Aggregate(strings.NewReader(sseFixture), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +100,7 @@ func TestAggregate(t *testing.T) {
 
 func TestAggregateSkipsNonDataLines(t *testing.T) {
 	raw := ": comment\n\n" + sseFixture
-	resp, err := Aggregate(strings.NewReader(raw))
+	resp, err := Aggregate(strings.NewReader(raw), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +123,7 @@ data: {"id":"x1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]
 data: [DONE]
 
 `
-	resp, err := Aggregate(strings.NewReader(raw))
+	resp, err := Aggregate(strings.NewReader(raw), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +380,7 @@ func TestStreamToolCallOverwriteClientSemantics(t *testing.T) {
 func streamFrames(t *testing.T, raw string) (frames []map[string]any, doneCount int) {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	if err := Stream(rec, strings.NewReader(raw)); err != nil {
+	if err := Stream(rec, strings.NewReader(raw), false); err != nil {
 		t.Fatal(err)
 	}
 	body := rec.Body.String()
@@ -435,7 +435,7 @@ func TestNormalizeFrame(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			raw, err := json.Marshal(normalizeFrame(c.in))
+			raw, err := json.Marshal(normalizeFrame(c.in, false))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -557,7 +557,7 @@ func TestStreamNoIdFallsBackToSentinel(t *testing.T) {
 func TestStreamDoneFallback(t *testing.T) {
 	// 上游流在无 [DONE] 时 EOF，Stream 必须兜底写一个 [DONE]
 	rec := httptest.NewRecorder()
-	err := Stream(rec, strings.NewReader("data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+	err := Stream(rec, strings.NewReader("data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -568,7 +568,7 @@ func TestStreamDoneFallback(t *testing.T) {
 
 	// 已有 [DONE] 时只写一次，不重复
 	rec2 := httptest.NewRecorder()
-	if err := Stream(rec2, strings.NewReader("data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n")); err != nil {
+	if err := Stream(rec2, strings.NewReader("data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"), false); err != nil {
 		t.Fatal(err)
 	}
 	if n := strings.Count(rec2.Body.String(), "data: [DONE]"); n != 1 {
@@ -578,7 +578,7 @@ func TestStreamDoneFallback(t *testing.T) {
 
 func TestStreamPassthrough(t *testing.T) {
 	rec := httptest.NewRecorder()
-	err := Stream(rec, strings.NewReader(sseFixture))
+	err := Stream(rec, strings.NewReader(sseFixture), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -642,7 +642,7 @@ func TestAggregateEmptyStreamCases(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			resp, err := Aggregate(strings.NewReader(c.raw))
+			resp, err := Aggregate(strings.NewReader(c.raw), false)
 			if c.wantErr {
 				if err == nil {
 					t.Fatalf("expected error, got nil (resp=%v)", resp)
@@ -669,7 +669,7 @@ func TestAggregateEmptyStreamCases(t *testing.T) {
 
 // TestAggregateEmptyStreamError 校验空流错误信息形如约定文案。
 func TestAggregateEmptyStreamError(t *testing.T) {
-	_, err := Aggregate(strings.NewReader(""))
+	_, err := Aggregate(strings.NewReader(""), false)
 	if err == nil || !strings.Contains(err.Error(), "no valid data events") {
 		t.Fatalf("err=%v", err)
 	}
@@ -689,7 +689,7 @@ func TestStreamEmptyFramesCase(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			rec := httptest.NewRecorder()
-			err := Stream(rec, strings.NewReader(c.raw))
+			err := Stream(rec, strings.NewReader(c.raw), false)
 			if err == nil {
 				t.Fatalf("expected error, got nil")
 			}
@@ -731,7 +731,7 @@ func TestStreamMidStreamErrorFramePassthrough(t *testing.T) {
 		"data: [DONE]\n\n"
 
 	rec := httptest.NewRecorder()
-	if err := Stream(rec, strings.NewReader(raw)); err != nil {
+	if err := Stream(rec, strings.NewReader(raw), false); err != nil {
 		t.Fatal(err)
 	}
 	body := rec.Body.String()
@@ -756,7 +756,7 @@ func TestStreamGarbageAfterDone(t *testing.T) {
 		"data: [DONE]\n\n" +
 		"data: {\"should\":\"not appear\"}\n\n"
 	rec := httptest.NewRecorder()
-	if err := Stream(rec, strings.NewReader(raw)); err != nil {
+	if err := Stream(rec, strings.NewReader(raw), false); err != nil {
 		t.Fatal(err)
 	}
 	body := rec.Body.String()
@@ -785,7 +785,7 @@ func TestStreamNormalPassthroughRegression(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			rec := httptest.NewRecorder()
-			if err := Stream(rec, strings.NewReader(c.raw)); err != nil {
+			if err := Stream(rec, strings.NewReader(c.raw), false); err != nil {
 				t.Fatal(err)
 			}
 			body := rec.Body.String()

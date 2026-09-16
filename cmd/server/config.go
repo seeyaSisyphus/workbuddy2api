@@ -94,6 +94,10 @@ type Config struct {
 	Features struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+		// ReasoningAlias 响应/流是否附 "reasoning" 别名字段（默认 true）。
+		// 上游只回 reasoning_content，部分客户端只认 OpenRouter 风格单字段 "reasoning"；
+		// 开启后两条路径都补等值别名（详见 upstream.Client.ReasoningAlias）。
+		ReasoningAlias bool `json:"reasoning_alias"`
 	} `json:"features"`
 
 	Prompt struct {
@@ -168,7 +172,8 @@ func Default() *Config {
 	// 显式 client_name="SaaS" 还原旧行为。
 	c.Upstream.ClientName = "WorkBuddy"
 	c.Features.SanitizeBlacklistFingerprints = true
-	c.Prompt.Mode = "passthrough" // 缺省 passthrough：默认透传客户端原始 system；显式配置 custom 仍可覆盖回替换
+	c.Features.ReasoningAlias = true // 默认补 "reasoning" 别名（只增字段，双字段客户端无感）
+	c.Prompt.Mode = "passthrough"    // 缺省 passthrough：默认透传客户端原始 system；显式配置 custom 仍可覆盖回替换
 	c.Pool.MaxInFlight = 3
 	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403
 	// 修复 P1-1）；0/负数 normalize 回落。显式 0 需配 -1 之外的方式关闭分档
@@ -273,6 +278,20 @@ func applyEnv(c *Config) {
 			c.Features.SanitizeBlacklistFingerprints = b
 		}
 	}
+	if v := os.Getenv("WB2A_REASONING_ALIAS"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Features.ReasoningAlias = b
+		}
+	}
+	if v := os.Getenv("WB2A_CHECKIN_WINDOW"); v != "" {
+		c.Schedule.CheckinWindow = v
+	}
+	if v := os.Getenv("WB2A_CHECKIN_JITTER"); v != "" {
+		c.Schedule.CheckinJitter = v
+	}
+	if v := os.Getenv("WB2A_CREDIT_REFRESH"); v != "" {
+		c.Schedule.CreditRefresh = v
+	}
 	if v := os.Getenv("WB2A_PROMPT_MODE"); v != "" {
 		c.Prompt.Mode = v
 	}
@@ -354,6 +373,29 @@ func (c *Config) normalize() error {
 	// 由 internal/config 统一实现，cmd/server 与 cmd/activity 共用同一份语义。
 	if err := c.Schedule.Normalize(); err != nil {
 		return err
+	}
+	// 签到窗口/抖动/积分刷新周期（本仓库新增能力，见 internal/config/schedule.go）。
+	if err := c.Schedule.ParseWindow(); err != nil {
+		return err
+	}
+	if c.Schedule.CheckinJitter == "" {
+		c.Schedule.CheckinJitter = "60s"
+	}
+	if c.Schedule.CheckinJitterDur, err = time.ParseDuration(c.Schedule.CheckinJitter); err != nil {
+		return fmt.Errorf("schedule.checkin_jitter: %w", err)
+	}
+	if c.Schedule.CheckinJitterDur < 0 {
+		c.Schedule.CheckinJitterDur = 0
+	}
+	// credit_refresh：空 = 关闭（与 "0" 同义）；非法值报错而非静默关闭。
+	if c.Schedule.CreditRefresh == "" {
+		c.Schedule.CreditRefresh = "0"
+	}
+	if c.Schedule.CreditRefreshDur, err = time.ParseDuration(c.Schedule.CreditRefresh); err != nil {
+		return fmt.Errorf("schedule.credit_refresh: %w", err)
+	}
+	if c.Schedule.CreditRefreshDur < 0 {
+		c.Schedule.CreditRefreshDur = 0
 	}
 	return c.normalizePrompt()
 }

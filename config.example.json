@@ -22,7 +22,10 @@
     "activity_enabled": true,
     "keepalive_enabled": true,
     "school_enabled": true,
-    "cat_enabled": true
+    "cat_enabled": true,
+    "checkin_window": "",
+    "checkin_jitter": "60s",
+    "credit_refresh": "0"
   },
   "global": {
     "enabled": true,
@@ -42,7 +45,8 @@
     "passthrough_ip": false
   },
   "features": {
-    "sanitize_blacklist_fingerprints": true
+    "sanitize_blacklist_fingerprints": true,
+    "reasoning_alias": true
   },
   "prompt": {
     "mode": "passthrough",
