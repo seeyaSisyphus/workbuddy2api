@@ -513,18 +513,15 @@ func (s *Scheduler) RunCreditRefreshNow() {
 			skipN++
 			continue
 		}
-		// global 账号的余额口径与 CN 不同（无 /v2/billing/meter/get-user-resource
-		// 语义），跳过而非误查；其积分刷新留待签到/手动工具路径。
-		if a.IsGlobal() {
-			skipN++
-			continue
-		}
 		// 余额是只读观测：token 过期时静默跳过（不刷新 token、不算失败），
 		// 刷新 token 是注册/签到路径的职责，避免这里与它们抢写 auths 文件。
 		if a.NeedsRefresh(0) {
 			skipN++
 			continue
 		}
+		// global 与 CN 的余额口径由 billingMeterPaths/UserResourceDetailed 内部按 realm
+		// 分流（global → /billing/meter/*，CN → /v2/...；解析回退 CapacityRemain 覆盖
+		// global 的 Free Plan 套餐），调用方无需区分——global 账号同样纳入定期刷新。
 		remain, buckets, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
 		if err != nil {
 			log.Printf("credit refresh %s: %v", logfmt.UID8(st.UID), err)
