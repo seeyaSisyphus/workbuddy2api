@@ -13,6 +13,13 @@ data/
 /wb2api
 /signin_bin
 
+# Windows 本机手工构建的工具产物（login.sh/trial.sh 会生成同名无后缀文件）
+/login.exe
+/credit.exe
+/trial.exe
+/trial_bin
+*/login_bin
+
 # Config with secrets (use config.example.json)
 config.json
 
