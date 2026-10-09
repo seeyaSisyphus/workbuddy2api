@@ -46,12 +46,27 @@ func TestClassify(t *testing.T) {
 		{400, `unapproved channel`, ErrContentBlocked},
 		// 通用 4xx（非审核文案）：仍判 ErrClient，只换号不罚。
 		{400, `bad request`, ErrClient},
-		// ErrBadParams：请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）。
-		// 这是"发给上游的 body 有问题"（网关截断已由 413 消灭，剩余为客户端畸形 JSON），
-		// 换了账号也一样 400，不罚号。具体词优先于通用 4xx。
+		// ErrBadParams：上游拒绝请求参数（HTTP 400）。两类形态——
+		//   · 11101 "Unmarshal chat params failed"：body 解析失败（网关截断已由 413 消灭，
+		//     剩余为客户端畸形 JSON）；
+		//   · 11133 "Invalid request parameters" / extError.code=model_param_invalid：模型
+		//     provider 拒绝请求参数（如 gpt-5.4 要求 max_tokens≥100 的 integer_below_min_value）。
+		// 都是"发给上游的 body 有问题"，换号也一样 400，不罚号、不轮转。具体词优先于通用 4xx。
 		{400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`, ErrBadParams},
 		{400, `Unmarshal chat params failed`, ErrBadParams},
 		{400, `{"code":11101,"msg":"x"}`, ErrBadParams},
+		// 11133（2026-10-01 收录；此前落 ErrClient → 出口默认映射成 503 no_healthy_account，
+		// 把客户端侧参数错谎报成服务器侧不可用，客户端据此无意义重试）。
+		{400, `{"code":11133,"msg":"Invalid request parameters","extError":{"code":"model_param_invalid"}}`, ErrBadParams},
+		{400, `{"code":11133,"msg":"Invalid request parameters"}`, ErrBadParams},
+		// 换子码（不带顶层 11133 数字）：靠 extError.code 通道命中。
+		{400, `{"extError":{"code":"model_param_invalid","message":"the request parameters were rejected by the model provider"}}`, ErrBadParams},
+		{400, `{"extError":{"code":"integer_below_min_value"}}`, ErrBadParams},
+		// 11115「prompt is too long」：输入+历史超模型上下文上限。同属客户端侧参数问题
+		// （重试无用，须精简内容/新建任务），2026-10-01 收录——此前落 ErrClient →
+		// 出口谎报 503 no_healthy_account。上游自带中文 displayMsg/displayTips。
+		{400, `{"code":11115,"msg":"prompt is too long: 1054548 tokens > 1048576 maximum","extError":{"code":"invalid_request_error"}}`, ErrBadParams},
+		{400, `prompt is too long: 900000 tokens > 800000 maximum`, ErrBadParams},
 		{200, `quota exceeded`, ErrHardCredit},
 		// 账号级授权/配额故障（与 429 一起纳入轮换）：11140 request illegal = auth_forbidden
 		// 风控（需重登），14017 = quota_not_activated（试用未激活，需完成 register）。修复前
@@ -314,6 +329,11 @@ func TestParseRateReset(t *testing.T) {
 	}{
 		{"6004 带时间+UTC+8 后缀", `{"code":6004,"msg":"将在 ` + ts + ` UTC+8 重置"}`, true},
 		{"6004 带时间无后缀", `{"code":6004,"msg":"将在 ` + ts + ` 重置"}`, true},
+		// 英文版文案（global 账号实测下发，与中文版同语义同时间格式）：
+		// 只认「将在 … 重置」会让英文 6004 落账号级退避——全账号锁死、
+		// 无模型级台账、无切模型豁免，正是本次线上全池 429 的根因。
+		{"6004 英文版 reset at", `{"code":6004,"msg":"usage exceeds frequency limit, but don't worry, your usage will reset at ` + ts + ` UTC+8, alternatively, you can switch to the other models to continue using it."}`, true},
+		{"6004 英文版无时间文案", `{"code":6004,"msg":"usage exceeds frequency limit, but don't worry."}`, false},
 		{"11140 rate-limiting 带时间(账号级也应对齐)", `{"code":11140,"msg":"The model provider is rate-limiting requests. 将在 ` + ts + ` UTC+8 重置"}`, true},
 		{"6004 无时间文案", `{"code":6004,"msg":"model usage limit exceeded"}`, false},
 		{"非法时间格式", `{"code":6004,"msg":"将在 明天 重置"}`, false},

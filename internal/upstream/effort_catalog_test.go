@@ -42,19 +42,18 @@ func TestEffortListingStaticFallback(t *testing.T) {
 	}
 }
 
-// TestEffortListingRealmSplit issue #84 核心：同模型 deepseek-v4.1-flash 在两个 realm 档位刻意不同。
-// global 只有 ['high']（WorkBuddy 国际版实测），不能沿用 CN 三档。
-func TestEffortListingRealmSplit(t *testing.T) {
-	cnEfforts, cnDef := EffortListing("cn", "deepseek-v4.1-flash", nil, "")
-	if !reflect.DeepEqual(cnEfforts, []string{"low", "high", "max"}) || cnDef != "high" {
-		t.Errorf("cn deepseek-v4.1-flash=%v/%q want [low high max]/high", cnEfforts, cnDef)
-	}
-	gEfforts, gDef := EffortListing("global", "deepseek-v4.1-flash", nil, "")
-	if !reflect.DeepEqual(gEfforts, []string{"high"}) {
-		t.Errorf("global deepseek-v4.1-flash=%v want [high]", gEfforts)
-	}
-	if gDef != "" {
-		t.Errorf("global deepseek-v4.1-flash defaultEffort=%q want empty (无 defaultReasoningEffort)", gDef)
+// TestEffortListingGlobalDeepSeekEfforts global DeepSeek 档位来自上游直连实测：
+// minimal 到 max 均可执行，off 不在能力表内；reasoning.effort=high 只是默认档。
+func TestEffortListingGlobalDeepSeekEfforts(t *testing.T) {
+	want := []string{"minimal", "low", "medium", "high", "xhigh", "max"}
+	for _, model := range []string{"deepseek-v4.1-flash", "deepseek-v4.1-flash-sg"} {
+		efforts, def := EffortListing("global", model, nil, "")
+		if !reflect.DeepEqual(efforts, want) {
+			t.Errorf("global %s efforts=%v want %v", model, efforts, want)
+		}
+		if def != "high" {
+			t.Errorf("global %s defaultEffort=%q want high", model, def)
+		}
 	}
 }
 

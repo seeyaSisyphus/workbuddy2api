@@ -20,11 +20,17 @@ cd "$(dirname "$0")"
 AUTH_DIR="./auths"
 CONTAINER="workbuddy2api"
 
+# 优先使用 python3，若无则回退到 python（Windows 环境兼容）
+PYTHON_CMD="python3"
+if ! command -v python3 &>/dev/null && command -v python &>/dev/null; then
+    PYTHON_CMD="python"
+fi
+
 mkdir -p "$AUTH_DIR"
 
 # login 工具：不存在才编译（源码改动后手动 go build -o login ./cmd/login）
 LOGIN_BIN="./login"
-if [[ ! -x "$LOGIN_BIN" ]]; then
+if [[ ! -x "$LOGIN_BIN" && ! -x "${LOGIN_BIN}.exe" ]]; then
     go build -o "$LOGIN_BIN" ./cmd/login
 fi
 
@@ -57,37 +63,51 @@ echo ""
 echo "  $AUTH_URL"
 echo ""
 
-if command -v xclip &>/dev/null; then
-    echo -n "$AUTH_URL" | xclip -selection clipboard 2>/dev/null && echo "(已复制到剪贴板)"
+if command -v clip.exe &>/dev/null; then
+    echo -n "$AUTH_URL" | clip.exe 2>/dev/null && echo "(已自动复制到剪贴板)"
+elif command -v clip &>/dev/null; then
+    echo -n "$AUTH_URL" | clip 2>/dev/null && echo "(已自动复制到剪贴板)"
+elif command -v xclip &>/dev/null; then
+    echo -n "$AUTH_URL" | xclip -selection clipboard 2>/dev/null && echo "(已自动复制到剪贴板)"
 elif command -v xsel &>/dev/null; then
-    echo -n "$AUTH_URL" | xsel --clipboard 2>/dev/null && echo "(已复制到剪贴板)"
+    echo -n "$AUTH_URL" | xsel --clipboard 2>/dev/null && echo "(已自动复制到剪贴板)"
 fi
 
-echo ""
-read -rp "完成登录后按 y 继续: " ans
-if [[ "$ans" != "y" && "$ans" != "Y" ]]; then
-    echo "已取消"
-    exit 1
-fi
 
 echo ""
-echo "正在获取 token..."
+echo "正在等待浏览器登录完成（登录成功后将自动识别；按 Ctrl+C 可取消）..."
 
-RESULT=$("$LOGIN_BIN" "--realm=$REALM" poll) || {
+RESULT=""
+MAX_WAIT=300
+ELAPSED=0
+INTERVAL=2
+
+while [[ $ELAPSED -lt $MAX_WAIT ]]; do
+    if RESULT=$("$LOGIN_BIN" "--realm=$REALM" poll 2>/dev/null); then
+        break
+    fi
+    sleep $INTERVAL
+    ELAPSED=$((ELAPSED + INTERVAL))
+    if (( ELAPSED % 10 == 0 )); then
+        echo "  [${ELAPSED}s] 等待登录中..."
+    fi
+done
+
+if [[ -z "$RESULT" ]]; then
     echo ""
-    echo "获取 token 失败。可能原因："
-    echo "  - 登录还没完成就按了 y（重新运行 ./login.sh 再试）"
-    echo "  - 登录页报错（把报错截图发出来排查）"
+    echo "获取 token 超时（超过 ${MAX_WAIT} 秒未完成登录），请重新运行 ./login.sh"
     exit 1
-}
+fi
+echo ""
+echo "登录成功，正在获取凭证..."
 
-TOKEN=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin)['access_token'])")
-REFRESH=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin)['refresh_token'])")
-EXPIRES_IN=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin)['expires_in'])")
-DOMAIN=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('domain',''))")
-USER_ID=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('uid',''))")
-ENT_ID=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('enterprise_id',''))")
-NICKNAME=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('nickname',''))")
+TOKEN=$(echo "$RESULT" | "$PYTHON_CMD" -c "import json,sys; print(json.load(sys.stdin)['access_token'])")
+REFRESH=$(echo "$RESULT" | "$PYTHON_CMD" -c "import json,sys; print(json.load(sys.stdin)['refresh_token'])")
+EXPIRES_IN=$(echo "$RESULT" | "$PYTHON_CMD" -c "import json,sys; print(json.load(sys.stdin)['expires_in'])")
+DOMAIN=$(echo "$RESULT" | "$PYTHON_CMD" -c "import json,sys; print(json.load(sys.stdin).get('domain',''))")
+USER_ID=$(echo "$RESULT" | "$PYTHON_CMD" -c "import json,sys; print(json.load(sys.stdin).get('uid',''))")
+ENT_ID=$(echo "$RESULT" | "$PYTHON_CMD" -c "import json,sys; print(json.load(sys.stdin).get('enterprise_id',''))")
+NICKNAME=$(echo "$RESULT" | "$PYTHON_CMD" -c "import json,sys; print(json.load(sys.stdin).get('nickname',''))")
 
 if [[ -z "$USER_ID" ]]; then
     echo "无法获取 uid，请检查 token 是否有效"
@@ -108,7 +128,7 @@ WB2A_LOGIN_TOKEN="$TOKEN" \
 WB2A_LOGIN_USER_ID="$USER_ID" \
 WB2A_LOGIN_ENT_ID="$ENT_ID" \
 WB2A_LOGIN_DOMAIN="$DOMAIN" \
-python3 - <<'PYEOF'
+"$PYTHON_CMD" - <<'PYEOF'
 import json, os, urllib.request, urllib.error
 
 token = os.environ["WB2A_LOGIN_TOKEN"]
@@ -166,7 +186,7 @@ WB2A_LOGIN_NICKNAME="$NICKNAME" \
 WB2A_LOGIN_REALM="$REALM" \
 WB2A_LOGIN_AUTH_FILE="$AUTH_FILE" \
 WB2A_LOGIN_ACTION="$ACTION" \
-python3 - <<'PYEOF'
+"$PYTHON_CMD" - <<'PYEOF'
 import json, os, sys, tempfile
 
 auth = {
@@ -193,7 +213,7 @@ try:
     os.replace(tmp_file, auth_file)
     # 权限检测：容器内 app(uid 10001) 需要读此文件
     st = os.stat(auth_file)
-    if st.st_uid != CONTAINER_UID:
+    if os.name != "nt" and st.st_uid != CONTAINER_UID:
         print(f"\n⚠️  权限警告：{auth_file} 属主 uid={st.st_uid}，容器内 app(uid={CONTAINER_UID}) 可能读不到")
         print(f"    请执行：chown -R {CONTAINER_UID}:{CONTAINER_UID} ./auths")
         print(f"    或在容器内登录（属主自动正确）：docker compose exec -it wb2api bash -c './login.sh'\n")
@@ -222,7 +242,7 @@ PYEOF
 if [[ "$REALM" == "global" ]]; then
 WB2A_LOGIN_TOKEN="$TOKEN" \
 WB2A_LOGIN_USER_ID="$USER_ID" \
-python3 - <<'PYEOF'
+"$PYTHON_CMD" - <<'PYEOF'
 import json, os, sys, urllib.request, urllib.error
 
 # scripts/global_region.py 定位：仓库根 scripts/（host；login.sh 已 cd 到仓库根）或
@@ -349,13 +369,13 @@ else:
 PYEOF
 fi
 echo ""
-if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
+if command -v docker &>/dev/null && docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER}$"; then
     echo "重启 $CONTAINER 加载新账号..."
     docker restart "$CONTAINER" >/dev/null
     sleep 2
     # API_KEY 从 config.json 读取（该变量在脚本中未定义，fallback 仅为占位，不会通过鉴权）
-    API_KEY=$(python3 -c "import json; print(json.load(open('config.json')).get('api_key',''))" 2>/dev/null)
-    COUNT=$(curl -s http://127.0.0.1:7863/status -H "Authorization: Bearer ${API_KEY:-test_key}" 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('accounts',[])))" 2>/dev/null || echo "?")
+    API_KEY=$("$PYTHON_CMD" -c "import json; print(json.load(open('config.json')).get('api_key',''))" 2>/dev/null)
+    COUNT=$(curl -s http://127.0.0.1:7863/status -H "Authorization: Bearer ${API_KEY:-test_key}" 2>/dev/null | "$PYTHON_CMD" -c "import json,sys; print(len(json.load(sys.stdin).get('accounts',[])))" 2>/dev/null || echo "?")
     echo "服务已重启，当前账号数: $COUNT"
 else
     echo "容器 $CONTAINER 未运行，auth 文件已保存，下次启动自动加载"

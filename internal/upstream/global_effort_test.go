@@ -39,20 +39,24 @@ func TestParseGlobalModelNamesEfforts(t *testing.T) {
 	}
 }
 
-// TestParseGlobalModelNamesSingleEffort reasoning.effort 单档字符串（无 supportedEfforts 数组）→ 视作单档表。
-func TestParseGlobalModelNamesSingleEffort(t *testing.T) {
+// TestParseGlobalModelNamesEffortIsNotWhitelist reasoning.effort 是当前/默认档元数据；
+// 缺少 supportedEfforts 数组时不得把它误解析成单档白名单。
+func TestParseGlobalModelNamesEffortIsNotWhitelist(t *testing.T) {
 	raw := `{"code":0,"data":{"models":[
 		{"id":"glm-5.2","reasoning":{"effort":"high"}}
 	]}}`
-	_, _, efforts, defaults, err := parseGlobalModelNames([]byte(raw))
+	_, infos, efforts, defaults, err := parseGlobalModelNames([]byte(raw))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if !sameStrings(efforts["glm-5.2"], []string{"high"}) {
-		t.Errorf("single-effort glm-5.2=%v want [high]", efforts["glm-5.2"])
+	if len(efforts) != 0 {
+		t.Errorf("efforts=%v want empty without explicit supportedEfforts", efforts)
 	}
 	if len(defaults) != 0 {
 		t.Errorf("defaults=%v want empty", defaults)
+	}
+	if len(infos) != 1 || infos[0].ReasoningEffort != "high" {
+		t.Errorf("infos=%+v want reasoning effort high preserved", infos)
 	}
 }
 
@@ -104,9 +108,9 @@ func globalEffortChatSrv(t *testing.T, modelsBody string, capture func([]byte)) 
 	}))
 }
 
-// TestGlobalEffortDowngradeStatic 探测失败（负缓存）→ global 请求按静态兜底表降级：
-// deepseek-v4.1-flash 只认 high，客户端传 low → 降级 high（issue #84 核心）。
-func TestGlobalEffortDowngradeStatic(t *testing.T) {
+// TestGlobalEffortStaticFallbackPreservesMax 探测失败时使用已验证的 global 静态能力表，
+// 客户端显式 max 必须原样出站，不能误降为 reasoning.effort 元数据中的 high。
+func TestGlobalEffortStaticFallbackPreservesMax(t *testing.T) {
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 
@@ -121,7 +125,7 @@ func TestGlobalEffortDowngradeStatic(t *testing.T) {
 	}
 	c.FetchGlobalModels(globalAcct()) // models endpoint 返回 code:500 → 解析失败 → 负缓存，桶空
 
-	rc, status, _, err := c.ChatStream(globalAcct(), []byte(`{"model":"deepseek-v4.1-flash","reasoning_effort":"low","messages":[]}`), "", ChatMeta{})
+	rc, status, _, err := c.ChatStream(globalAcct(), []byte(`{"model":"deepseek-v4.1-flash","reasoning_effort":"max","messages":[]}`), "", ChatMeta{})
 	if err != nil || status != 200 {
 		t.Fatalf("chat status=%d err=%v", status, err)
 	}
@@ -131,8 +135,8 @@ func TestGlobalEffortDowngradeStatic(t *testing.T) {
 	if err := json.Unmarshal(outbound, &m); err != nil {
 		t.Fatalf("unmarshal outbound: %v (%s)", err, outbound)
 	}
-	if got, _ := m["reasoning_effort"].(string); got != "high" {
-		t.Errorf("reasoning_effort=%v want high (global 静态兜底降级 low→high)", m["reasoning_effort"])
+	if got, _ := m["reasoning_effort"].(string); got != "max" {
+		t.Errorf("reasoning_effort=%v want max (global static fallback must preserve supported max)", m["reasoning_effort"])
 	}
 }
 

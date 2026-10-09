@@ -231,6 +231,22 @@ func (r *Router) Count() int {
 	return len(r.entries)
 }
 
+// BoundUIDs 返回当前未过期绑定涉及的账号 uid 集合（只读快照）。
+// 供积分刷新加速档把"被会话绑定"算作活跃（scheduler 经 SessionBound 回调消费）。
+func (r *Router) BoundUIDs() map[string]bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	now := time.Now()
+	out := map[string]bool{}
+	for _, e := range r.entries {
+		if expired(e, now, r.cfg.TTL) {
+			continue
+		}
+		out[e.uid] = true
+	}
+	return out
+}
+
 // gcOnce 清理 TTL 过期的绑定，并镜像删除。
 func (r *Router) gcOnce(now time.Time) int {
 	r.mu.Lock()

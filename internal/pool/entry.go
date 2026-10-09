@@ -12,7 +12,8 @@ type CoolKind int
 
 const (
 	CoolHard CoolKind = iota // 余额不足 → 冷却到次日 04:00（等签到恢复）
-	CoolSoft                 // 429 → 短冷却
+	CoolSoft                 // 429/WAF → 短冷却
+	CoolRate                 // 本地速率调度冷却：窗口内选中次数超限（防单号被打太多；非上游错误）
 )
 
 func (k CoolKind) String() string {
@@ -21,22 +22,32 @@ func (k CoolKind) String() string {
 		return "hard_credit"
 	case CoolSoft:
 		return "soft_rate"
+	case CoolRate:
+		return "rate_schedule"
 	}
 	return "unknown"
 }
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID           string    `json:"uid"`
-	Realm         string    `json:"realm,omitempty"`
-	Nickname      string    `json:"nickname,omitempty"`
-	Credits       int64     `json:"credits"`
-	Cooling       bool      `json:"cooling"`
-	CoolKind      string    `json:"cool_kind,omitempty"`
-	CoolRemaining int64     `json:"cool_remaining_sec,omitempty"`
-	Until         time.Time `json:"until,omitempty"`
-	Reason        string    `json:"reason,omitempty"`
-	SoftStreak    int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
+	UID      string `json:"uid"`
+	Realm    string `json:"realm,omitempty"`
+	Nickname string `json:"nickname,omitempty"`
+	Credits  int64  `json:"credits"`
+	// CreditsExpiring credits 中「即将到期」的部分（<= pool.expiring_soon 窗口）。
+	// 选号最高优先级依据：这部分不用就作废，因此含它的账号优先被调度。
+	// 零值也显式输出（运维口径：缺失会被误读为"没统计"，实际是"没有快过期积分"）。
+	CreditsExpiring int64     `json:"credits_expiring"`
+	// LowBalance credits 低于选号积分底线（pool.low_credit_stop）：该号正被积分保护
+	// （选号第 0 层跳过，除非快过期积分豁免或对请求模型持有实测免费豁免）。
+	// 底线关闭（0）时恒 false。
+	LowBalance      bool      `json:"low_balance"`
+	Cooling         bool      `json:"cooling"`
+	CoolKind        string    `json:"cool_kind,omitempty"`
+	CoolRemaining   int64     `json:"cool_remaining_sec,omitempty"`
+	Until           time.Time `json:"until,omitempty"`
+	Reason          string    `json:"reason,omitempty"`
+	SoftStreak      int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
 	// RateLimitedModels 当前仍在限额的模型列表（issue #36 限额台账）。
 	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
@@ -85,15 +96,15 @@ type entry struct {
 	// （比 NoteModelCost 的 0.3 更平滑——选号权重不应被单次成败主导）。
 	// 持久化（stateAccount.SuccessEMA/ErrorEMA）；旧 state.json 缺字段时从
 	// successCount/errTotal 反推初始值（向后兼容）。
-	successEMA float64
-	errorEMA   float64
-	lastErr         time.Time // 最近一次错误时间
-	lastSuccess     time.Time // 最近一次成功时间
-	coolKind        CoolKind
-	until           time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
-	disabled        bool
-	reason          string
-	lastUsed        time.Time // 最近被选中时刻（防并发撞号）
+	successEMA  float64
+	errorEMA    float64
+	lastErr     time.Time // 最近一次错误时间
+	lastSuccess time.Time // 最近一次成功时间
+	coolKind    CoolKind
+	until       time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
+	disabled    bool
+	reason      string
+	lastUsed    time.Time // 最近被选中时刻（防并发撞号）
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效（高并发/低精度时钟下：
@@ -131,6 +142,13 @@ type entry struct {
 	sessionDeadFails int
 	// inFlight 单账号在途请求数（运行态，不持久化）。用 atomic 避免 Pick 热路径拿写锁。
 	inFlight atomic.Int64
+
+	// 速率调度窗口（本地防"单号被打太多"；运行态，不持久化）：
+	// hotWindowStart 为当前窗口起点，hotCount 为窗口内被选中次数；达到上限时
+	// pick 路径置 CoolRate 冷却（见 Pool.notePickLocked）。重启后窗口清零，
+	// 最多多放行一窗的量，可接受（换来零 schema 变更）。
+	hotWindowStart time.Time
+	hotCount       int
 
 	// modelCost 实测扣费账本：model → 观测（运行态，不持久化）。
 	// 由每次成功请求的 usage.credit 折算而来（上游没有"按模型的用量"接口，

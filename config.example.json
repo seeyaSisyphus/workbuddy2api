@@ -25,7 +25,8 @@
     "cat_enabled": true,
     "checkin_window": "",
     "checkin_jitter": "60s",
-    "credit_refresh": "0"
+    "credit_refresh": "0",
+    "credit_refresh_low": "45s"
   },
   "global": {
     "enabled": true,
@@ -64,7 +65,9 @@
     "breaker_cooldown_max": "6h",
     "idle_weight_per_hour": 0.5,
     "idle_weight_max": 5.0,
-    "expiring_soon": "168h"
+    "expiring_soon": "168h",
+    "low_credit_stop": 100,
+    "low_credit_accel": 300
   },
   "session_sticky": {
     "enabled": true,

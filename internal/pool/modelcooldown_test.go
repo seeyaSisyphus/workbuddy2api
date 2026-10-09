@@ -47,6 +47,22 @@ func TestModelCooldownsIndependent(t *testing.T) {
 
 // TestModelCooldownsBDoesNotOverwriteA 模型 B 触发 6004 后，A 的冷却截止不被覆盖：
 // 这是本 issue 的核心——旧实现用单 until 字段，B 会覆盖 A。
+// wantUntilAligned 断言冷却截止**精确对齐**上游重置墙钟：until ∈ [reset, reset+resetSkewBuffer]。
+//
+// 这是 2026-09-30 起的新契约（旧契约是 min(reset, now+softRateMax) 的 2h 截断）：
+//   - 不早于 reset：不提前放号去重撞上游限额——旧契约把 10~12h 后的重置砍到 2h，
+//     每 2 小时放号重撞一轮，实测累计约 30 次无谓上游调用 + 反复 503/429 风暴；
+//   - 不晚于 reset+缓冲：重置后再等 resetSkewBuffer 吸收时钟偏移/秒级精度截断，
+//     不无故拖延恢复。±1s 容差覆盖执行耗时。
+func wantUntilAligned(t *testing.T, what string, got, reset time.Time) {
+	t.Helper()
+	d := got.Sub(reset)
+	if d < -time.Second || d > resetSkewBuffer+time.Second {
+		t.Errorf("%s until=%v want ∈ [%v, %v]（精确对齐上游重置 + 缓冲）",
+			what, got, reset, reset.Add(resetSkewBuffer))
+	}
+}
+
 func TestModelCooldownsBDoesNotOverwriteA(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
@@ -63,9 +79,7 @@ func TestModelCooldownsBDoesNotOverwriteA(t *testing.T) {
 	if !okA {
 		t.Fatalf("A(glm-5.3) 的模型冷却条目丢失（被 B 覆盖？）")
 	}
-	if d := mcA.Until.Sub(resetA); d < -time.Second || d > time.Second {
-		t.Errorf("A until=%v want ~%v（B 的冷却不得覆盖 A 的截止）", mcA.Until, resetA)
-	}
+	wantUntilAligned(t, "A（B 的冷却不得覆盖 A 的截止）", mcA.Until, resetA)
 	if !until.IsZero() {
 		t.Errorf("until=%v 应为零值（6004 从不写账号级 until）", until)
 	}
@@ -91,13 +105,17 @@ func TestCooldownSoftForModelDoesNotClobberUntil(t *testing.T) {
 	}
 }
 
-// TestCooldownSoftForModelCapsUntilKeepsResetAt 6004 写 modelCooldowns：
-// until 截断到 soft_rate_max，reset_at 保留上游原始墙钟（issue #36 台账语义迁移）。
-func TestCooldownSoftForModelCapsUntilKeepsResetAt(t *testing.T) {
+// TestCooldownSoftForModelAlignsResetIgnoringSoftRateMax 上游权威重置**不再被
+// soft_rate_max 截断**：soft_rate_max 只封指数退避，权威重置走独立的 24h 兜底封顶
+// （cappedResetUntilLocked），reset_at 仍保留上游原始墙钟（issue #36 台账语义迁移）。
+//
+// 旧契约 min(reset, now+softRateMax) 会把 10~12h 后的重置砍到 2h，每 2 小时放号重撞一次
+// 6004（2026-09-30 实测 6 个号累计约 30 次无谓上游调用 + 反复 503/429 风暴）。
+func TestCooldownSoftForModelAlignsResetIgnoringSoftRateMax(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.SetSoftRateMax(10 * time.Minute)
-	reset := time.Now().Add(2 * time.Hour) // 远超封顶 → until 截断到 10m，reset_at 保留 2h
+	p.SetSoftRateMax(10 * time.Minute)     // 指数退避仍受它封顶
+	reset := time.Now().Add(2 * time.Hour) // 远超 soft_rate_max：旧契约会截到 10m
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
 	p.mu.RLock()
 	mc, ok := p.byUID["u1"].modelCooldowns["glm-5.3"]
@@ -105,11 +123,67 @@ func TestCooldownSoftForModelCapsUntilKeepsResetAt(t *testing.T) {
 	if !ok {
 		t.Fatal("modelCooldowns 缺少 glm-5.3")
 	}
-	if rem := mc.Until.Sub(time.Now()); rem <= 0 || rem > 10*time.Minute+time.Second {
-		t.Errorf("Until 应在 (0,10m] 区间，实际剩余 %v", rem)
-	}
+	wantUntilAligned(t, "model（权威重置不受 soft_rate_max 截断）", mc.Until, reset)
 	if d := mc.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
-		t.Errorf("ResetAt=%v want ~2h 后=%v", mc.ResetAt, reset)
+		t.Errorf("ResetAt=%v want ~2h 后=%v（台账保留上游原始墙钟）", mc.ResetAt, reset)
+	}
+}
+
+// TestCooldownSoftForModelAlignsLongReset 直接复刻 2026-09-30 事故：上游 6004 给的重置点
+// 在 10 小时后，本地必须冷却到那时，而不是 2h 后就放号重撞。
+func TestCooldownSoftForModelAlignsLongReset(t *testing.T) {
+	p := New("") // 不注入 softRateMax：用默认 2h，与线上一致
+	p.Add(&auth.Auth{UID: "u1"})
+	reset := time.Now().Add(10 * time.Hour)
+	p.CooldownSoftForModel("u1", 600*time.Second, reset, "deepseek-v4.1-flash", "6004 model rate limit")
+	st, _ := p.Status("u1")
+	if len(st.RateLimitedModels) != 1 {
+		t.Fatalf("rate_limited_models=%+v want 1 行", st.RateLimitedModels)
+	}
+	if rem := st.RateLimitedModels[0].Until.Sub(time.Now()); rem < 9*time.Hour {
+		t.Fatalf("10h 后的重置被截断成 %v——旧契约下每 2h 放号重撞一次 6004", rem)
+	}
+	wantUntilAligned(t, "model", st.RateLimitedModels[0].Until, reset)
+	// 该模型仍受限 → 选不到该号；其它模型不受影响（模型豁免）。
+	if got := p.PickExcludingForRealm(nil, "deepseek-v4.1-flash", ""); got != nil {
+		t.Errorf("该模型仍在限流，不得选到该号，got %s", got.UID)
+	}
+	if got := p.PickExcludingForRealm(nil, "glm-5.3", ""); got == nil {
+		t.Error("其它模型应仍可用（模型豁免）")
+	}
+}
+
+// TestCooldownSoftForModelPastResetImmediate 上游重置时刻已过（时钟偏移/文案过期）
+// → 立即恢复可选，不把号白锁一段。
+func TestCooldownSoftForModelPastResetImmediate(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(-time.Hour), "glm-5.3", "6004 model rate limit")
+	time.Sleep(5 * time.Millisecond) // 已过重置被钳到 now+1ms（既有约定），等它滑过
+	if got := p.PickExcludingForRealm(nil, "glm-5.3", ""); got == nil {
+		t.Fatal("重置时刻已过 → 应立即恢复可选（不得白锁）")
+	}
+}
+
+// TestPickEarliestExpirySkipsModelCooled 全冷却兜底不得选「该模型被上游拒过且未到恢复
+// 时刻」的号——否则兜底探测会白撞一次 6004。
+//
+// 只有**账号级冷却 + 模型级冷却并存**时才会暴露：模型级冷却单独存在时不写 e.until，
+// expiry() 为零值，兜底"碰巧"跳过它；两者并存时 expiry() 非零，旧实现会把它选出来。
+func TestPickEarliestExpirySkipsModelCooled(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	// 先账号级（CooldownSoftRate 会清空 modelCooldowns），再写该模型 6004。
+	p.CooldownSoftRate("u1", time.Hour, time.Now().Add(time.Hour), "429 rate limit")
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(2*time.Hour), "m", "6004 model rate limit")
+
+	if got := p.PickExcludingForRealm(nil, "m", ""); got != nil {
+		t.Fatalf("该号在 m 上仍被上游限流，兜底不得选中，got %s", got.UID)
+	}
+	// 对照：换模型（无模型级冷却）→ 同一条兜底路径应能选中它，证明上面的 nil 不是别的原因。
+	if got := p.PickExcludingForRealm(nil, "other", ""); got == nil || got.UID != "u1" {
+		t.Fatalf("other 模型无模型级冷却，兜底应选中 u1，got %+v", got)
 	}
 }
 
@@ -177,9 +251,7 @@ func TestModelCooldownsPreservedByNoteSuccess(t *testing.T) {
 	if !ok {
 		t.Fatalf("NoteSuccess 后 A(glm-5.3) 独立冷却被清除——模型独立性被破坏")
 	}
-	if d := mc.Until.Sub(resetA); d < -time.Second || d > time.Second {
-		t.Errorf("A until=%v want ~%v（不得被 NoteSuccess 干扰）", mc.Until, resetA)
-	}
+	wantUntilAligned(t, "A（不得被 NoteSuccess 干扰）", mc.Until, resetA)
 }
 
 // TestModelCooldownsClearedByRevive 签到解冻（reviveCoolingLocked）→ 模型级 6004 冷却清零。
@@ -505,9 +577,7 @@ func TestModelCooldownsPersistRoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatal("重启后 modelCooldowns[glm-5.3] 缺失（持久化未恢复）")
 	}
-	if d := mc.Until.Sub(reset); d < -time.Second || d > time.Second {
-		t.Errorf("恢复后 model until=%v want ~reset=%v (diff %v)", mc.Until, reset, d)
-	}
+	wantUntilAligned(t, "恢复后 model", mc.Until, reset)
 	if mc.ResetAt != mc.ResetAt || !mc.ResetAt.Equal(reset) {
 		t.Errorf("恢复后 model reset_at=%v want %v", mc.ResetAt, reset)
 	}

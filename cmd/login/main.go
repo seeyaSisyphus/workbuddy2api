@@ -210,7 +210,17 @@ func validateRealmMatch(stateRealm, cliRealm string) error {
 // （可注入临时文件便于测试）。空 realm 视为缺省（调用方已归一）。
 func runURL(base, origin, realm, statePath string, client *http.Client, out io.Writer) {
 	headers := commonHeaders(origin)
-	data, _, err := doJSON(client, http.MethodPost, base+"/v2/plugin/auth/state?platform=CLI", headers, bytes.NewReader([]byte("{}")))
+	var (
+		data []byte
+		err  error
+	)
+	for attempt := range 3 {
+		data, _, err = doJSON(client, http.MethodPost, base+"/v2/plugin/auth/state?platform=CLI", headers, bytes.NewReader([]byte("{}")))
+		if err == nil {
+			break
+		}
+		time.Sleep(time.Duration(attempt+1) * 600 * time.Millisecond)
+	}
 	if err != nil {
 		fatal("auth state failed: %v", err)
 	}

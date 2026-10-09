@@ -320,9 +320,8 @@ func (c *Client) globalModelsOnce(a *auth.Auth, path string) ([]string, []ModelI
 //   - 窄表：data 为字符串数组。
 //
 // 对象形态与 CN 模型对象同构（dynModelEntry 共用解析口径），额外产出全字段 ModelInfo
-// 与 reasoning.supportedEfforts / defaultEffort（P0：global 域 effort 探测，解析不到时
-// 调用方回落 staticEffortCap 兜底表——prepareBody 的 globalEffortMap 与 /v1/models 的
-// EffortListing）。窄表形态无元数据 → infos/桶为空。
+// 与 reasoning.supportedEfforts / defaultEffort。仅返回 reasoning.effort 时保留该展示字段，
+// 但不据此生成 supportedEfforts；调用方按 staticEffortCap 兜底或原样透传。
 //
 // 解析成功但名单为空 → 返回错误（调用方回落静态，等价"该端点没给全"）。
 func parseGlobalModelNames(raw []byte) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, err error) {
@@ -376,17 +375,13 @@ func parseGlobalModelNames(raw []byte) (names []string, infos []ModelInfo, effor
 		mi := m.modelInfo()
 		mi.ID = id // name 兜底形态下 id 取自 name，对齐 names 输出
 		infos = append(infos, mi)
-		// effort 桶：supportedEfforts 数组优先；缺数组但 reasoning.effort 单档非空 → 视作单档表。
+		// supportedEfforts 是显式能力白名单。reasoning.effort 只是当前/默认档元数据，
+		// 缺数组时不得误写成单档表，否则合法 high/max 等请求会被错误降级。
 		if len(m.Reasoning.SupportedEfforts) > 0 {
 			if efforts == nil {
 				efforts = make(map[string][]string)
 			}
 			efforts[id] = m.Reasoning.SupportedEfforts
-		} else if e := strings.TrimSpace(m.Reasoning.Effort); e != "" {
-			if efforts == nil {
-				efforts = make(map[string][]string)
-			}
-			efforts[id] = []string{e}
 		}
 		if d := strings.TrimSpace(m.Reasoning.DefaultEffort); d != "" {
 			if defaults == nil {

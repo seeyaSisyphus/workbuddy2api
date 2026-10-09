@@ -173,8 +173,8 @@ func TestApplyErrorPolicySoftRateBodyResetBeatsHeader(t *testing.T) {
 	ue := &upstream.Error{Kind: upstream.ErrSoftRate, Status: 429, RetryAfter: 1 * time.Minute} // 头值与文案明显不同
 	h.applyErrorPolicy("u1", upstream.ErrSoftRate, body, "glm-5.3", ue)
 	st, _ := p.Status("u1")
-	if d := st.Until.Sub(bodyReset); d < -time.Second || d > time.Second {
-		t.Errorf("until=%v want ~bodyReset=%v (body reset must beat header)", st.Until, bodyReset)
+	if d := st.Until.Sub(bodyReset); d < -time.Second || d > resetAlignSlack {
+		t.Errorf("until=%v want ~bodyReset=%v (body reset must beat header, 含对齐缓冲)", st.Until, bodyReset)
 	}
 }
 

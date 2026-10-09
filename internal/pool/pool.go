@@ -35,6 +35,21 @@ type Pool struct {
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64
+	// rateWindow / rateLimit / rateCooldown 本地速率调度（SetRateSchedule 注入）：
+	// 单账号在 rateWindow 内被选中达到 rateLimit 次 → 冷却 rateCooldown。
+	// rateLimit<=0 或窗口/冷却非正 = 关闭（零回归）。见 notePickLocked。
+	rateWindow   time.Duration
+	rateLimit    int
+	rateCooldown time.Duration
+	// lowCreditStop 选号积分底线（SetLowCredit 注入；0 = 关闭底线过滤）：
+	// credits 低于此值的候选在 pick 第 0 层被跳过（快过期积分达标者豁免）。
+	lowCreditStop int64
+	// lowCreditAccel 低余额加速阈值（SetLowCredit 注入；0 = 关闭事件探测）：
+	// NoteModelCost 扣费使 credits 下行跨越此值时触发一次 lowCreditProbe 回调。
+	lowCreditAccel int64
+	// lowCreditProbe 低余额事件回调（SetLowCreditProbeFunc 注入；nil = 不触发）。
+	// 在 NoteModelCost 锁外调用；实现方负责延迟与去重（scheduler 侧 ~15s 延迟探测）。
+	lowCreditProbe func(uid string)
 	// persistFails 本地 state.json 连续落盘失败计数（仅 saveLocked 在持锁下读写，无需 atomic）。
 	// 用于落盘失败的日志节流：首败/每 N 次提醒/恢复各打一条，避免磁盘满时刷屏。
 	persistFails int
@@ -137,12 +152,46 @@ func (p *Pool) inFlightLimit(e *entry) int {
 	return p.maxInFlight
 }
 
+// SetRateSchedule 注入本地速率调度参数：单账号在 window 内被选中达到 limit 次
+// 即冷却 cooldown（CoolRate）。语义是"防单个号被本地调度打太多"（上游风控按
+// 账号用量/速率判定），与上游错误冷却（429/WAF）共用 until/coolKind 字段但
+// 原因独立（reason 前缀 "rate schedule"）。
+// limit<=0 或 window/cooldown<=0 = 关闭（零回归）。默认值来自 config rate_*。
+func (p *Pool) SetRateSchedule(window time.Duration, limit int, cooldown time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.rateWindow, p.rateLimit, p.rateCooldown = window, limit, cooldown
+}
+
 // SetStore 注入池状态快照镜像（redisstore.Store）。nil 表示不镜像（纯本地恢复）。
 // 必须在 SyncToDir 之前调用，使"择新恢复"发生在账号对齐之前。
 func (p *Pool) SetStore(s StoreSnapshotter) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.store = s
+}
+
+// SetLowCredit 注入积分保护参数：stop 为选号底线（credits 低于此值的候选在 pick
+// 第 0 层被跳过），accel 为低余额加速阈值（跌破时触发 lowCreditProbe 事件）。
+// 0 = 关闭对应能力；负值保留原值（风格同 SetBreaker）。
+func (p *Pool) SetLowCredit(stop, accel int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if stop >= 0 {
+		p.lowCreditStop = stop
+	}
+	if accel >= 0 {
+		p.lowCreditAccel = accel
+	}
+}
+
+// SetLowCreditProbeFunc 注册低余额事件回调：NoteModelCost 扣费使 credits 下行跨越
+// lowCreditAccel 时在锁外触发一次（边缘触发，跌破后再次扣减不重复触发）。
+// nil = 不触发。main 装配时注入 scheduler 的延迟探测（pool 不反向依赖 scheduler）。
+func (p *Pool) SetLowCreditProbeFunc(fn func(uid string)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lowCreditProbe = fn
 }
 
 // Acquire 为 uid 占一个在途名额（会话粘性命中后调用）；池上限内返回 true。

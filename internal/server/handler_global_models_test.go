@@ -259,3 +259,40 @@ func countOf(list []string, s string) int {
 	}
 	return n
 }
+
+// TestModelListExcludesAliases 别名是纯入站便利层：/v1/models 只列上游真实 ID，
+// 别名拼写不得作为条目出现。表驱动遍历 modelAliases，日后新增别名自动覆盖。
+func TestModelListExcludesAliases(t *testing.T) {
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
+	resetModelsCache()
+
+	// global 面下发别名目标本体（deepseek-v4.1-flash），但不下发别名拼写。
+	// CN 面由 fake 固定返回 cn-dyn-model（见 newGlobalModelsHandlerFake 的鉴权头分流）。
+	cf := newGlobalModelsHandlerFake(t, 200, modelsProbeBody("deepseek-v4.1-flash", "gpt-5.4"))
+	p := testPoolWith(
+		&auth.Auth{UID: "cn1", AccessToken: "at_cn", Domain: "www.codebuddy.cn", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "g1", AccessToken: "at_gl", Domain: "www.workbuddy.ai", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: cf.up, GlobalEnabled: true})
+
+	ids := map[string]bool{}
+	for _, m := range h.modelList() {
+		id, _ := m["id"].(string)
+		ids[id] = true
+	}
+
+	if !ids["global:deepseek-v4.1-flash"] {
+		t.Errorf("列表应含上游真实 ID global:deepseek-v4.1-flash；实际 ids=%v", ids)
+	}
+	for key := range modelAliases {
+		for _, prefix := range []string{"cn:", "global:"} {
+			if ids[prefix+key] {
+				t.Errorf("别名拼写 %q 不得作为列表条目（/v1/models 只列上游真实 ID）", prefix+key)
+			}
+		}
+		if ids[key] {
+			t.Errorf("裸别名拼写 %q 不得作为列表条目", key)
+		}
+	}
+}

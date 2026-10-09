@@ -128,6 +128,21 @@ type Config struct {
 		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到查余额时，到期时间在此窗口内
 		// 的积分被标记为"快过期"，选号优先消耗（issue:积分过期）。空/0 = 禁用分桶。
 		ExpiringSoon string `json:"expiring_soon"`
+		// RateWindow / RateLimit / RateCooldown 本地速率调度（防"单个号被调度打太多"）：
+		// 单号在 RateWindow 内被选中达到 RateLimit 次 → 冷却 RateCooldown。
+		// 与"每日配额"的差别：按**速率**触发（风控打的就是突发/速度），且自愈（窗口滑过即恢复）。
+		// RateLimit<=0 = 关闭；窗口/冷却空值回落默认。
+		RateWindow   string `json:"rate_window"`   // 默认 "15m"
+		RateLimit    int    `json:"rate_limit"`    // 默认 30
+		RateCooldown string `json:"rate_cooldown"` // 默认 "30m"
+		// LowCreditStop 选号积分底线，默认 100：credits 低于此值的候选在选号第 0 层被跳过
+		// （快过期积分达标的号豁免——快过期的分不用白不用）；全部候选都低于底线时跳过
+		// 本层降级使用（weightOf 自然偏好高余额号）。0 = 关闭底线过滤；负值回落默认。
+		LowCreditStop int64 `json:"low_credit_stop"`
+		// LowCreditAccel 低余额加速阈值，默认 300：活跃号 credits 低于此值时积分刷新
+		// 切加速档（schedule.credit_refresh_low），且逐请求扣费跌破此值时触发一次
+		// 单号延迟探测。0 = 关闭加速档与事件探测；负值回落默认。
+		LowCreditAccel int64 `json:"low_credit_accel"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -144,6 +159,8 @@ type Config struct {
 	SessionTTL          time.Duration `json:"-"`
 	SessionGCInterval   time.Duration `json:"-"`
 	ExpiringSoonDur     time.Duration `json:"-"`
+	RateWindowDur       time.Duration `json:"-"`
+	RateCooldownDur     time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -186,6 +203,13 @@ func Default() *Config {
 	c.Pool.IdleWeightPerHour = 0.5
 	c.Pool.IdleWeightMax = 5.0
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
+	// 速率调度默认开启：15 分钟窗口内单号被选中 30 次（≈120 次/小时）即冷却 30 分钟。
+	// 取值保守但不苛刻：正常多号轮换下单号远达不到；重试风暴/单号独食形态会立刻触发。
+	c.Pool.RateWindow = "15m"
+	c.Pool.RateLimit = 30
+	c.Pool.RateCooldown = "30m"
+	c.Pool.LowCreditStop = 100  // 积分保护底线：余额 <100 的号不再参与正常选号
+	c.Pool.LowCreditAccel = 300 // 低余额加速阈值：跌破 300 触发探测、活跃号刷新切加速档
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
@@ -292,6 +316,19 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_CREDIT_REFRESH"); v != "" {
 		c.Schedule.CreditRefresh = v
 	}
+	if v := os.Getenv("WB2A_CREDIT_REFRESH_LOW"); v != "" {
+		c.Schedule.CreditRefreshLow = v
+	}
+	if v := os.Getenv("WB2A_LOW_CREDIT_STOP"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			c.Pool.LowCreditStop = n
+		}
+	}
+	if v := os.Getenv("WB2A_LOW_CREDIT_ACCEL"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			c.Pool.LowCreditAccel = n
+		}
+	}
 	if v := os.Getenv("WB2A_PROMPT_MODE"); v != "" {
 		c.Prompt.Mode = v
 	}
@@ -355,6 +392,19 @@ func (c *Config) normalize() error {
 	if c.ExpiringSoonDur < 0 {
 		c.ExpiringSoonDur = 0 // 负值视为禁用，避免 upstream 判定窗口反转
 	}
+	// 速率调度：空值回落默认；负/零 duration 视为关闭（limit<=0 时本就关闭）。
+	if c.Pool.RateWindow == "" {
+		c.Pool.RateWindow = "15m"
+	}
+	if c.RateWindowDur, err = time.ParseDuration(c.Pool.RateWindow); err != nil {
+		return fmt.Errorf("pool.rate_window: %w", err)
+	}
+	if c.Pool.RateCooldown == "" {
+		c.Pool.RateCooldown = "30m"
+	}
+	if c.RateCooldownDur, err = time.ParseDuration(c.Pool.RateCooldown); err != nil {
+		return fmt.Errorf("pool.rate_cooldown: %w", err)
+	}
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120
 	}
@@ -396,6 +446,23 @@ func (c *Config) normalize() error {
 	}
 	if c.Schedule.CreditRefreshDur < 0 {
 		c.Schedule.CreditRefreshDur = 0
+	}
+	// credit_refresh_low：空值回落默认 45s（风格同 soft_rate_max）；显式 "0"/负值 = 无加速档。
+	if c.Schedule.CreditRefreshLow == "" {
+		c.Schedule.CreditRefreshLow = "45s"
+	}
+	if c.Schedule.CreditRefreshLowDur, err = time.ParseDuration(c.Schedule.CreditRefreshLow); err != nil {
+		return fmt.Errorf("schedule.credit_refresh_low: %w", err)
+	}
+	if c.Schedule.CreditRefreshLowDur < 0 {
+		c.Schedule.CreditRefreshLowDur = 0
+	}
+	// 积分保护底线/加速阈值：负值回落默认；0 = 关闭（stop 不过滤 / accel 不加速不探测）。
+	if c.Pool.LowCreditStop < 0 {
+		c.Pool.LowCreditStop = 100
+	}
+	if c.Pool.LowCreditAccel < 0 {
+		c.Pool.LowCreditAccel = 300
 	}
 	return c.normalizePrompt()
 }

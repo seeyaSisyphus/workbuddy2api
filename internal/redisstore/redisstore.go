@@ -13,6 +13,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -116,24 +117,38 @@ type Upstash struct {
 	done chan struct{}
 	// closeOnce 保证 Close 幂等（多次调用只关一次 done channel）。
 	closeOnce sync.Once
+	// pending 已提交但尚未执行的写计数（含正在执行与排队中）。Close 靠它判"排空"。
+	//
+	// 为什么不能靠 sem 占满推断排空（2026-10-01 修复）：旧实现让每个写 goroutine
+	// 自己抢槽，Close 期间 close(done) 会让**仍在排队**的写命中 done 分支直接 return
+	// ——它从未取到槽，Close 的"占满 cap 个槽"推断因此误判为已排空，排队写被丢弃。
+	// 实测 TestUpstashCloseDrainsQueuedWrites 稳定失败：cap=1 时第一个写阻塞、第二个
+	// 排队，Close 返回时第二个写从未执行（停机时丢镜像写）。
+	// pending 在**提交处**同步自增（不在 goroutine 内），Close 只需等它归零。
+	pending atomic.Int64
 }
 
 // goWrite 以 fire-and-forget 方式执行 fn：写槽（sem）有界并发，Close 前提交的写
 // 必然执行（停机镜像完整性），Close 后提交的写直接丢弃（进程已在退出）。
+//
+// 提交语义（修复要点）：done 检查与槽位占用都在**调用方 goroutine 同步完成**——
+// 一旦 goWrite 返回，该写就已被计入 pending 且已持槽（或在等槽），Close 不可能
+// 漏掉它。旧实现在 goroutine 内做这两件事，Close 期间的排队写会被 done 提前拒绝。
 func (u *Upstash) goWrite(fn func()) {
 	u.closeOnceGuard()
+	// Close 之后的提交直接丢弃（同步判定，无竞态：与 Close 的 close(done) 互斥于
+	// 同一 channel 的关闭语义）。
+	select {
+	case <-u.done:
+		return
+	default:
+	}
+	u.pending.Add(1)
 	go func() {
-		// 先检查关停标志再抢写槽：Close 之后的提交直接丢弃。
-		select {
-		case <-u.done:
-			return
-		default:
-		}
-		select {
-		case <-u.done:
-			return
-		case u.sem <- struct{}{}:
-		}
+		defer u.pending.Add(-1)
+		// 抢写槽：此处**不再**监听 done——提交时已判定过存活，此刻放弃会让
+		// Close 的排空等待（pending 归零）永远等不到，且违背"已提交必执行"。
+		u.sem <- struct{}{}
 		defer func() { <-u.sem }()
 		fn()
 	}()
@@ -151,23 +166,22 @@ func (u *Upstash) closeOnceGuard() {
 // Close 等待已提交的异步写全部执行完毕，再关底层 redis 连接；幂等。
 // 之后新提交的写直接丢弃（goWrite 的 done 检查）。停机路径在 pool.Close() 后调用：
 // pool 的最后一次 Flush→SaveState 已提交，本方法保证它写完才返回。
+//
+// 排空判据是 pending 归零（**不是** sem 占满推断——排队中的写从未取到槽，
+// 占满推断会把它误判为已排空，见 Upstash.pending 注释的 2026-10-01 修复）。
 func (u *Upstash) Close() error {
 	u.closeOnceGuard()
 	u.closeOnce.Do(func() { close(u.done) })
-	// 等在途 + 排队的写排空：写槽可被全部腾出，说明没有写在执行或排队
-	//（已持槽的写释放即归位，排队者会立刻取到——所以持续占满直到排空为止）。
+	// 轮询 pending 归零：已提交的写（含排队中）执行完才返回。
+	// 兜底超时（单写上限 5s × 并发数，10s 富余）：卡死的写不应阻塞进程退出。
 	deadline := time.Now().Add(10 * time.Second)
-	for i := 0; i < cap(u.sem); i++ {
-		select {
-		case u.sem <- struct{}{}:
-		case <-time.After(time.Until(deadline)):
-			// 兜底超时（单写上限 5s×cap，10s 富余）：卡死的写不应阻塞进程退出。
-			log.Printf("[redisstore] WARN: Close 等待在途写超时，放弃（镜像可能未写完）")
+	for u.pending.Load() > 0 {
+		if time.Now().After(deadline) {
+			log.Printf("[redisstore] WARN: Close 等待在途写超时（pending=%d），放弃（镜像可能未写完）",
+				u.pending.Load())
 			return u.closeClient()
 		}
-	}
-	for i := 0; i < cap(u.sem); i++ {
-		<-u.sem
+		time.Sleep(time.Millisecond)
 	}
 	return u.closeClient()
 }

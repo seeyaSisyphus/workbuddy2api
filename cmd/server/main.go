@@ -21,9 +21,38 @@ import (
 	"workbuddy2api/internal/upstream"
 )
 
+// proxyEnvKeys 会被 clearProxyEnv 清除的代理环境变量（大小写两种拼法都覆盖——
+// Go 的 http.ProxyFromEnvironment 对 HTTP_PROXY/http_proxy 都认）。
+var proxyEnvKeys = []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"}
+
+// clearProxyEnv 直连优先：清掉进程级代理环境变量（上游传输层用
+// http.ProxyFromEnvironment，只读这些变量）。
+//
+// 背景：本机用户级环境变量常年指向本地 FlClash（127.0.0.1:7890），网关一旦继承就会从
+// 台湾节点出口 → 上游 WAF 403 回归（2026-09-27 与 09-30 两次事故：每个号先吃 waf_block
+// 403、紧接着吃 11133）。走家宽直连时实测连续两天零 WAF，且快 4.6 倍（335ms vs 1538ms）。
+// CN 域同时受益：此前 CN 流量也被迫过代理，FlClash 一抖就把 CN + global 一起打死。
+//
+// 为什么放在程序内而不是启动脚本：进程是否带上这些变量，取决于**它是被谁拉起的**——
+// 双击 exe、手动命令行、看门狗/计划任务都会原样继承用户级变量；start-silent.vbs 虽有
+// WScript.Shell.Environment("PROCESS").Remove，但该清除对 objShell.Run 子进程的生效性
+// 并不可靠（2026-09-30 20:41 由该脚本拉起的进程仍在走 127.0.0.1:7890，而 20:46 同一路径
+// 拉起的不在——同一脚本两种结果，说明不能依赖它）。放在程序内则与启动方式彻底解耦。
+// 需要恢复走代理：删掉本函数调用，或在启动该进程的 shell 里导出代理变量后自行改回。
+func clearProxyEnv() {
+	for _, k := range proxyEnvKeys {
+		if os.Getenv(k) != "" {
+			log.Printf("清除代理环境变量 %s（上游直连 workbuddy.ai；原因见 main.go clearProxyEnv 注释）", k)
+			_ = os.Unsetenv(k)
+		}
+	}
+}
+
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to config json")
 	flag.Parse()
+
+	clearProxyEnv()
 
 	cfg, err := Load(*cfgPath)
 	if err != nil {
@@ -62,6 +91,15 @@ func main() {
 	p.SetMaxInFlightGlobal(cfg.Pool.MaxInFlightGlobal) // global 域在途分档（WAF 403 修复 P1-1，默认 2）
 	p.SetSoftRateMax(cfg.SoftRateMaxDur) // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
+	// 本地速率调度：单号窗口内被选中超限 → 冷却（防"单号被打太多"被上游风控标记）。
+	p.SetRateSchedule(cfg.RateWindowDur, cfg.Pool.RateLimit, cfg.RateCooldownDur)
+	// 积分保护：选号底线（低于 low_credit_stop 跳过）+ 低余额加速阈值（跌破触发探测/加速刷新）。
+	p.SetLowCredit(cfg.Pool.LowCreditStop, cfg.Pool.LowCreditAccel)
+	if cfg.Pool.RateLimit > 0 {
+		log.Printf("速率调度已启用：单号 %s 内选中 ≥%d 次 → 冷却 %s", cfg.RateWindowDur, cfg.Pool.RateLimit, cfg.RateCooldownDur)
+	} else {
+		log.Printf("速率调度已关闭（pool.rate_limit<=0）")
+	}
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
@@ -123,6 +161,12 @@ func main() {
 	up.BillingBaseGlobal = cfg.Global.BillingBase
 	up.GlobalEnabled = cfg.Global.Enabled
 
+	// 会话绑定集合回调：供积分刷新加速档把"被会话绑定"算作活跃（无粘性路由时为 nil）。
+	var sessionBound func() map[string]bool
+	if sessRouter != nil {
+		sessionBound = sessRouter.BoundUIDs
+	}
+
 	sch := scheduler.New(scheduler.Config{
 		Pool:                p,
 		Upstream:            up,
@@ -140,6 +184,10 @@ func main() {
 		CheckinWindowTo:   cfg.Schedule.WindowToDur,
 		CheckinJitter:     cfg.Schedule.CheckinJitterDur,
 		CreditRefresh:     cfg.Schedule.CreditRefreshDur,
+		// 积分保护：低余额加速档（周期 + 阈值 + 会话绑定活跃口径）。
+		CreditRefreshLow: cfg.Schedule.CreditRefreshLowDur,
+		LowCreditAccel:   cfg.Pool.LowCreditAccel,
+		SessionBound:     sessionBound,
 		HistoryFile:       history.DefaultPath(cfg.StateFile), // 积分快照与 state.json 同目录
 		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
 		TravelDisabled:      !cfg.Schedule.TravelEnabled,
@@ -148,6 +196,9 @@ func main() {
 		SchoolDisabled:      !cfg.Schedule.SchoolEnabled,
 		CatDisabled:         !cfg.Schedule.CatEnabled,
 	})
+	// 低余额事件探测回调注入：pool 扣费跌破 low_credit_accel → scheduler 延迟 ~15s
+	// 单号探测（回调注入方向：pool 不反向依赖 scheduler）。
+	p.SetLowCreditProbeFunc(sch.ScheduleLowCreditProbe)
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
 		log.Printf("签到已禁用（schedule.checkin_enabled=false）")

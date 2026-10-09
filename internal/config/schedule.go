@@ -56,6 +56,11 @@ type Schedule struct {
 	// （Pool.SetCreditsDetailed），让选号依据的积分与临期额度保持新鲜，
 	// 不必等下一次签到。空/"0" = 关闭（只在签到时刷新，现状不变）。
 	CreditRefresh string `json:"credit_refresh"`
+	// CreditRefreshLow 低余额加速档刷新周期（如 "45s"）：存在活跃低余额号
+	// （credits < pool.low_credit_accel，近 10 分钟被选中或被会话绑定）时，
+	// credit refresh 切到此周期且只刷这些号。空值回落默认 "45s"；
+	// 显式 "0"/负值 = 无加速档（恒按 credit_refresh 全量刷新）。
+	CreditRefreshLow string `json:"credit_refresh_low"`
 
 	// 解析后（json:"-"）：由 ParseWindow 填充，供 scheduler 直接使用。
 	//
@@ -68,6 +73,8 @@ type Schedule struct {
 	CheckinJitterDur time.Duration `json:"-"`
 	// CreditRefreshDur 生效的积分刷新周期；0 = 关闭。
 	CreditRefreshDur time.Duration `json:"-"`
+	// CreditRefreshLowDur 生效的低余额加速档刷新周期；0 = 无加速档。
+	CreditRefreshLowDur time.Duration `json:"-"`
 	// 猫猫旅行已退役 travel_interval_minutes：旅行现为独立排程（travel_hours）。
 	// 旧 config 里的该键因 JSON 未知字段而自然忽略，不报错。
 }

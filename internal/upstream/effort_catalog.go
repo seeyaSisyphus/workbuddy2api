@@ -5,13 +5,9 @@
 //   - 本文件按 realm 分开的产品级静态兜底表（远端缺失时补齐）；
 //   - 两者皆无 → 不在 /v1/models 输出 effort 字段（omitted，不是空数组）。
 //
-// 档位值照抄参考仓库 dsh-codearts：CN/CodeBuddy 面取 src/product.ts CODEBUDDY_FALLBACK_MODELS
-// ∪ src/buddy-adapter.ts:126-137 REASONING_EFFORTS；global/WorkBuddy 面取 src/product.ts
-// WORKBUDDY_FALLBACK_MODELS。两个 realm 对同一模型给出不同档位（如 deepseek-v4.1-flash：
-// CN 三档 ['low','high','max']、global 仅 ['high']），故**按 realm 分表**，绝不混用。
-//
-// 只列**可枚举**档位的模型；仅有固定默认档（glm-5.1/kimi-* 的 medium）同样入表，
-// 但其档位是「可枚举单档」而非「无选择器」，照抄参考仓库如实暴露。
+// 档位表按 realm 分开：远端显式 supportedEfforts 优先，缺失时才使用对应 realm 的
+// 静态兜底。reasoning.effort 是当前推理档元数据，不是 supportedEfforts 白名单；
+// 上游仅返回 effort 而没有数组时，禁止把它推导成单档能力表。
 package upstream
 
 // effortCap 一个模型的档位能力（对齐产品兜底表条目 reasoningEfforts + defaultReasoningEffort）。
@@ -42,27 +38,28 @@ var cnEffortFallback = map[string]effortCap{
 }
 
 // globalEffortFallback global / WorkBuddy 国际版面静态兜底表。
-// 注意 deepseek-v4.1-flash 在国际版**只有 ['high']**（product.ts:190 实测 IDE 缓存），
-// 与 CN 面的三档刻意不同——往 WorkBuddy 上游发 low/max 是非法参数 400。
+// deepseek-v4.1-flash 及其 sg 变体经上游直连实测接受 minimal/low/medium/high/xhigh/max，
+// off 会被拒绝；v3/config 的 reasoning.effort=high 不是“仅支持 high”的声明。
 var globalEffortFallback = map[string]effortCap{
-	"fast-model":          {efforts: []string{"medium"}},
-	"balanced-model":      {efforts: []string{"medium"}},
-	"primary-model":       {efforts: []string{"high"}},
-	"hy4-preview-f":       {efforts: []string{"high"}, defaultEffort: "high"},
-	"hy3":                 {efforts: []string{"low", "high"}, defaultEffort: "high"},
-	"deepseek-v4.1-flash": {efforts: []string{"high"}},
-	"gpt-6-astra":         {efforts: []string{"low", "medium", "high", "xhigh", "max"}, defaultEffort: "high"},
-	"gpt-5.6-sol":         {efforts: []string{"low", "medium", "high", "xhigh", "max"}, defaultEffort: "high"},
-	"gpt-5.6-terra":       {efforts: []string{"low", "medium", "high", "xhigh", "max"}, defaultEffort: "high"},
-	"gpt-5.6-luna":        {efforts: []string{"low", "medium", "high", "xhigh", "max"}, defaultEffort: "high"},
-	"gpt-5.5":             {efforts: []string{"low", "medium", "high", "xhigh"}, defaultEffort: "high"},
-	"gpt-5.4":             {efforts: []string{"low", "medium", "high", "xhigh"}, defaultEffort: "high"},
-	"gpt-5.3-codex":       {efforts: []string{"medium"}},
-	"gemini-3.5-flash":    {efforts: []string{"medium"}},
-	"glm-5.3":             {efforts: []string{"low", "high", "max"}, defaultEffort: "high"},
-	"glm-5.2":             {efforts: []string{"high", "xhigh"}, defaultEffort: "high"},
-	"kimi-k3":             {efforts: []string{"medium"}},
-	"kimi-k2.6":           {efforts: []string{"medium"}},
+	"fast-model":             {efforts: []string{"medium"}},
+	"balanced-model":         {efforts: []string{"medium"}},
+	"primary-model":          {efforts: []string{"high"}},
+	"hy4-preview-f":          {efforts: []string{"high"}, defaultEffort: "high"},
+	"hy3":                    {efforts: []string{"low", "high"}, defaultEffort: "high"},
+	"deepseek-v4.1-flash":    {efforts: []string{"minimal", "low", "medium", "high", "xhigh", "max"}, defaultEffort: "high"},
+	"deepseek-v4.1-flash-sg": {efforts: []string{"minimal", "low", "medium", "high", "xhigh", "max"}, defaultEffort: "high"},
+	"gpt-6-astra":            {efforts: []string{"low", "medium", "high", "xhigh", "max"}, defaultEffort: "high"},
+	"gpt-5.6-sol":            {efforts: []string{"low", "medium", "high", "xhigh", "max"}, defaultEffort: "high"},
+	"gpt-5.6-terra":          {efforts: []string{"low", "medium", "high", "xhigh", "max"}, defaultEffort: "high"},
+	"gpt-5.6-luna":           {efforts: []string{"low", "medium", "high", "xhigh", "max"}, defaultEffort: "high"},
+	"gpt-5.5":                {efforts: []string{"low", "medium", "high", "xhigh"}, defaultEffort: "high"},
+	"gpt-5.4":                {efforts: []string{"low", "medium", "high", "xhigh"}, defaultEffort: "high"},
+	"gpt-5.3-codex":          {efforts: []string{"medium"}},
+	"gemini-3.5-flash":       {efforts: []string{"medium"}},
+	"glm-5.3":                {efforts: []string{"low", "high", "max"}, defaultEffort: "high"},
+	"glm-5.2":                {efforts: []string{"high", "xhigh"}, defaultEffort: "high"},
+	"kimi-k3":                {efforts: []string{"medium"}},
+	"kimi-k2.6":              {efforts: []string{"medium"}},
 }
 
 // staticEffortCap 按 realm 取静态兜底条目；未命中返回 zero effortCap（efforts=nil）。
@@ -113,13 +110,9 @@ func containsEffort(efforts []string, want string) bool {
 	return false
 }
 
-// globalEffortMap global 域降级用的 effort 能力表：静态兜底表为基，远端桶覆盖（权威优先）。
-//
-// prepareBody 对 global 请求调此函数（而非直接用远端桶），因为 global 上游可能不下发
-// supportedEfforts——此时也必须按产品静态表降级（issue #84：deepseek-v4.1-flash 国际版
-// 只认 high，客户端传 low/max 必降级到 high，否则上游 400 毁掉请求）。
-// 语义对齐参考仓库 effortsFor（remoteMeta → productFallback → 静态表），只取前两级：
-// 远端桶（探测已解析）→ 本产品静态表（本文件），缺档位即无（不再到通用静态表）。
+// globalEffortMap global 域 effort 能力表：静态兜底为基，远端显式 supportedEfforts 覆盖。
+// 远端仅提供 reasoning.effort 时不生成 supportedEfforts 白名单；prepareBody 再按本表
+// 归一化显式档位，避免把目录中的当前/默认 effort 错当成唯一支持档。
 func globalEffortMap(remoteEfforts map[string][]string, remoteDefaults map[string]string) (map[string][]string, map[string]string) {
 	efforts := make(map[string][]string, len(globalEffortFallback)+len(remoteEfforts))
 	defs := make(map[string]string, len(globalEffortFallback)+len(remoteDefaults))

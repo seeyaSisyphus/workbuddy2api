@@ -77,6 +77,7 @@ type Handler struct {
 	cfg     Config
 	mux     *http.ServeMux
 	degrade degradeGate
+	gate    chatGate // 连续「不可服务」失败故障门（见 failgate.go）
 }
 
 // NewHandler 构建 handler。
@@ -101,6 +102,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
+	h.mux.HandleFunc("GET /livez", h.livez)
 	return h
 }
 
@@ -146,6 +148,31 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 		"total":          total,
 		"service":        ServiceName,
 		"realm_servable": realmServable,
+	})
+}
+
+// livez 纯存活探针：只要进程还能响应 HTTP 就恒 200，**不掺任何业务状态**。
+//
+// 与 /healthz 的分工（2026-10-01 引入，见 ai-servers-guardian）：
+//   - /healthz：**业务可用性**，全池无健康号时返回 503。给负载均衡/编排用——它要据此
+//     摘流量，所以"账号全冷却"这种"进程活着但暂时没得服务"必须如实报 503。
+//   - /livez  ：**进程存活**，恒 200。给守护进程用——守护进程的职责是"进程死了就拉起"，
+//     而不是"业务不可用就重启"。用 /healthz 判活会踩两个坑：
+//     (1) 全池账号级冷却时持续 503 → 守护进程 kill+restart，而重启**治不好它**
+//     （账号级冷却持久化在 data/state.json，重启原样恢复）→ 每 30s 一次的稳定死循环；
+//     (2) 每次重启都重置调度器周期（积分刷新 10m / 猫猫旅行 / 活跃上报 / token 保活），
+//     重启间隔 < 周期时这些任务**永不执行**。
+//     实测（2026-10-01）：全号模型级冷却 → /healthz 200（modelExempt 兜住）；
+//     全号账号级冷却 → /healthz 503，而 /livez 恒 200。
+//
+// 注意：本端点不报告"端口是否 accept"以外的信息——进程卡死/端口不监听时客户端根本
+// 拿不到响应，守护进程据此判死仍然成立（这正是它该管的那类故障）。
+// 同样恒无鉴权，身份靠 service 字段 + X-Service 头。
+func (h *Handler) livez(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("X-Service", ServiceName)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"service": ServiceName,
+		"status":  "alive",
 	})
 }
 
@@ -466,14 +493,35 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.Unmarshal(body, &peek)
 
-	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
-	// bareModel 用于选号/粘性/账本/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
+	// 模型名解析（D6 前缀 + 别名两层，见 resolve_model.go）：model 名可能带
+	// "[realm:]" 前缀（含同义 "g:"），剥出 realm + bareModel；别名层再对 bare 做一次
+	// 规范名替换（与 realm 无关）。bareModel 用于选号/粘性可用集合/账本/冷却键/出站
+	// body 重写（前缀与别名都是网关侧协议，上游只认规范裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
 	realm, bareModel := resolveModel(peek.Model)
 
+	// 故障门键：按「域|模型」隔离——某模型的失败风暴不误伤其它模型。
+	gateKey := realm + "|" + bareModel
+
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
-	defer st.done()
+	defer func() {
+		// 任意一次成功即复位故障门（连续失败计数与退避指数一起清）。
+		if st.status == http.StatusOK {
+			h.gate.noteOK(gateKey)
+		}
+		st.done()
+	}()
+
+	// 故障门：连续「无可用账号」失败达到阈值后短暂开门（429 + Retry-After），
+	// 把客户端重试风暴挡在选号/上游轮换之前；单次失败不触发（见 failgate.go）。
+	if wait, open := h.gate.open(gateKey, time.Now()); open {
+		w.Header().Set("Retry-After", retryAfterSeconds(wait))
+		writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_exceeded",
+			"gateway is backing off after repeated failures; retry after the Retry-After window")
+		st.status = http.StatusTooManyRequests
+		return
+	}
 
 	tried := map[string]bool{}
 	var lastErr error
@@ -548,8 +596,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		degradedApplied = true
 	}
 
-	// outbound model 名重写为 bareModel（D6）：realm 前缀是网关侧路由协议，
-	// 上游不认前缀（global 账号也请求裸模型名）。裸名时 bareModel==peek.Model 恒等。
+	// outbound model 名重写为 bareModel（D6 + 别名层）：前缀与别名都是网关侧协议，
+	// 上游只认规范裸名（global 账号也请求裸模型名）。恒等场景（裸名未命中别名）跳过改写。
+	// 注：rewriteModel 对 bare=="" 原样返回，故 "g:" 这类空前缀形态出站仍带原串
+	// ——与既有 "global:" / "cn:" 行为一致，非本次引入。
 	if bareModel != peek.Model {
 		body = rewriteModel(body, bareModel)
 	}
@@ -706,6 +756,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusBadRequest
 				return
 			}
+			// 请求参数被上游拒绝（11101 解析失败 / 11133 model_param_invalid）：**不轮转**。
+			//
+			// 依据（2026-10-01 实测）：body 在进循环前一次性构造，循环内唯一按账号变化的
+			// 只有 prepareBody 注入的 prompt_cache_key（缓存键，不参与上游参数校验），
+			// 客户端参数部分对所有账号逐字节相同 —— 换号必然同样被拒。当日 16:58 / 17:26
+			// 两批各 3 次 11133 正是一次请求轮转 3 个账号（6da89543 / a6553148 / 5c391d2b）
+			// 全部被拒、成功率 0%，白烧 2 次上游调用，还把客户端等待从 ~7s 拖到 ~20s
+			// （每次换号还要过一次 rotateBackoff 退避）。
+			//
+			// 原设计注释写"仍轮转——不同账号可能有不同的模型权限"，但该说法对「JSON 解析
+			// 失败」与「模型 provider 拒绝请求参数」两类都不成立：前者与账号无关，后者由
+			// 出站模型（非账号）决定。真正与账号相关的模型权限差异走 11102 → ErrModelBlocked
+			// 的独立路径，不受此处影响。
+			if kind == upstream.ErrBadParams {
+				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				break // 终止轮转 → 末端映射回 400 invalid_request_error（见下）
+			}
 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
 			// 5755fe3 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
@@ -769,11 +838,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	//
 	//   - 上游返回（*upstream.Error）→ error.message 装**上游 body 原文**（code/msg/
 	//     requestId 原样保留，如 {"code":6004,"msg":"…","requestId":"…"}）。HTTP 状态码
-	//     按 OpenAI 兼容口径映射类别：ErrSoftRate → 429（限流语义、客户端应等待重试），
-	//     其余保持 503（网关侧无健康账号可用）。业务 code 取本地分类可读名
-	//     （rate_limit_exceeded / no_healthy_account）。
+	//     按「谁的问题、能不能重试」二分映射，**不再一律 503**：
+	//       · ErrSoftRate  → 429 rate_limit_exceeded（限流语义，客户端应等待重试）
+	//       · ErrBadParams → 400 invalid_request_error（客户端请求参数错，重试无用）
+	//       · ErrModelBlocked → 404 model_not_found（模型名不存在，重试无用）
+	//       · 其余          → 503 no_healthy_account（网关侧无健康账号可用，重试可能成功）
+	//     为什么必须区分：503 no_healthy_account 的语义是"服务器侧、可重试"，把参数错
+	//     映射成它会把"你的请求有问题"谎报成"网关没号了"，客户端据此无意义重试。
 	//   - 本地调度类错误（无可用账号 acct==nil、传输层抖动、非上游返回的 lastErr）
 	//     → 保留自有文案 no_healthy_account（本地错误没有上游原文可透传，不编造）。
+	//     其中"该模型在本域全部不可用且已知恢复时刻"会**点名模型 + 恢复时长**，见下方
+	//     `ue == nil && hintOK && waitHint > 0` 分支。
 	status := http.StatusServiceUnavailable
 	code := "no_healthy_account"
 	msg := "all accounts are temporarily unavailable, please retry later"
@@ -784,10 +859,83 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusTooManyRequests
 			code = "rate_limit_exceeded"
 			msg = "rate limited: all accounts are cooling down, please wait a moment and try again"
+		case upstream.ErrBadParams:
+			// 请求参数被上游拒绝（11101 解析失败 / 11133 model_param_invalid）：这是
+			// **客户端侧**错误——账号健康、网关可用，重试不会改变结果。
+			//
+			// 必须回 4xx 而非 503：旧的默认映射把「你的参数有问题」谎报成「网关没有可用
+			// 账号」（503 no_healthy_account 是"服务器侧、可重试"语义），客户端据此无意义
+			// 重试。实测 2026-10-01 16:58 / 17:26 两批各 3 次 11133，涉及 3 个不同账号，
+			// 同一请求轮转 3 号全部被拒（成功率 0%），而客户端只看到 503。
+			// 判据与 ErrContentBlocked 同口径：内容/参数问题都不归账号，回 4xx + 不轮转。
+			status = http.StatusBadRequest
+			code = "invalid_request_error"
+			msg = "request rejected by upstream: invalid request parameters"
+		case upstream.ErrModelBlocked:
+			// 11102「该后端无此模型」：**所有**账号都被上游以"无此模型"拒绝 —— 这是
+			// **客户端侧**问题（模型名拼错，或客户端/代理标记没剥干净），重试不会改变结果。
+			//
+			// 必须回 404 而非 503：旧的默认映射把"你给的模型名不存在"谎报成"网关没有可用
+			// 账号"。2026-10-02 实测：dsh(sidechat) 会话发 "wb/g:deepseek-flash"（代理
+			// provider 标记残留）→ 上游 11102 ×6（5 个 CN 号逐个吃 6h 负缓存）→ 客户端
+			// 看到 503 no_healthy_account，按"服务器侧、可重试"语义自动重试 5 次
+			// （attempt=1..4 全撞闸门 429），而真因只是模型名多了一层 "wb/"。
+			// 模型名标记剥离见 resolve_model.go 的 stripClientMarkers（同一日的修复）。
+			status = http.StatusNotFound
+			code = "model_not_found"
+			msg = "model is not available on this gateway, check the model name"
 		}
 		if s := strings.TrimSpace(ue.Msg); s != "" {
 			// 上游原文优先：透传 code/msg/requestId，不拼接本地前缀。
 			msg = s
+		}
+	}
+	// Retry-After：把"最早可能恢复可服务"的时长告诉客户端（钳 [1,60]s），避免
+	// 客户端无信息时按秒空转。NextUsableIn 按 healthyForModel 计、**不看并发名额**：
+	//   - waitHint > 0：账号在冷却，提示真实恢复时长；
+	//   - waitHint = 0：此刻**存在**健康号，本次拒绝只是并发名额一时占满
+	//     （毫秒~秒级自愈）→ 落到钳位下限 1s，只做退避提示，不谎报长等待。
+	//
+	// 仅对"重试可能成功"的 503/429 下发：400 参数错是**终态**错误（改请求才有用，重试
+	// 同一请求永远不会成功），带 Retry-After 等于邀请客户端重试一个注定失败的请求——
+	// 正是本次要修的误导链之一。
+	retryable := status == http.StatusServiceUnavailable || status == http.StatusTooManyRequests
+	waitHint, hintOK := h.cfg.Pool.NextUsableIn(bareModel, realm)
+	if retryable && hintOK {
+		w.Header().Set("Retry-After", retryAfterSeconds(waitHint))
+	}
+	// 模型级不可用的可读文案：ue==nil 表示没有上游原文可透传（纯本地调度失败：一个号
+	// 都没选到），此时若该模型在**本域**有明确恢复时刻（hintOK && waitHint>0），把
+	// "哪个模型、多久恢复、可以切模型"说清楚。
+	//
+	// 为什么必须点名模型：通用文案 "all accounts are temporarily unavailable" 让用户
+	// 无从判断是"网关坏了"还是"这个模型被限流了"。2026-10-02 实测：CN 五个号的 glm-5.3
+	// 全部被 6004 限额（同一时刻 global:glm-5.3 立刻可用），客户端只看到通用 503，
+	// 用户来问"我调用 cn glm，现在卡住了？"——上游自己都会提示 "alternatively, you can
+	// switch to the other models"，网关没有理由不说。
+	// waitHint==0（并发名额一时占满）保持通用文案：毫秒级自愈，报"切模型"反而误导。
+	if ue == nil && hintOK && waitHint > 0 {
+		msg = fmt.Sprintf("no account is available for model %q on %s right now; earliest recovery in ~%s — switch to another model or retry later",
+			bareModel, realm, formatWait(waitHint))
+	}
+	// failgate 只放行唯一的**瞬时**情形，其余失败一律升级（持久性失败必须挡重试风暴）：
+	//
+	//   - transientSlotPressure（st.uid=="" && hintOK && waitHint==0）：一个号都没选到，
+	//     但池子里**有健康号** → 只是并发名额一时占满，毫秒~秒级自愈 → 不升级。
+	//     2026-09-29 下午实测：30 并发下 5 次瞬时 503 被闸门放大成 20 次失败。
+	//   - st.uid != ""：**已选到号、上游报错**（6004 / 5xx 等）→ 重试还是同样结果，
+	//     属持久性问题 → 升级。不能只看"有没有健康号"：这类失败不冷却账号，池子始终
+	//     "有健康号"，会把整段风暴漏计——同日 15:48~15:59 实测 30 次失败全被漏计，
+	//     客户端无人阻挡地重试并白烧 90 次上游轮换。
+	//   - ErrBadParams（400 参数错）：**同样计入**。它虽是客户端侧错误、重试也不会变好，
+	//     但实测客户端会对它反复重试（2026-10-01 16:58 / 17:26 同一 requestId 在客户端
+	//     出现两次、每次白烧 3 次换号轮换），不下闸门就会演变成上游风暴。闸门需连续 5 次
+	//     才开，正常客户端看到首个 400 即停，不会误伤。
+	//   - 其余（全冷却 hintOK&&waitHint>0、无非禁用号 !hintOK）同为持久性不可用 → 升级。
+	if retryable || (ue != nil && ue.Kind == upstream.ErrBadParams) {
+		transientSlotPressure := st.uid == "" && hintOK && waitHint == 0
+		if !transientSlotPressure {
+			h.gate.noteFail(gateKey, time.Now(), waitHint)
 		}
 	}
 	writeOpenAIError(w, status, code, msg)
@@ -857,14 +1005,16 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// softStreak 指数堆加。
 		//   - 模型级（6004）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型
 		//     豁免（既有 issue #31 语义）。
-		//   - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免
+		//   - 账号级（非 6004）→ CooldownSoftRateReset：写账号级 until，不产生模型豁免
 		//     （普通账号级限流不该因切模型绕过）。
+		// 两条都走**权威重置对齐**（精确到该墙钟 + 缓冲 + 24h 兜底），不用 softRateMax
+		// 的 2h 截断——上游重置常在 10~12h 后，截断等于提前放号重撞（2026-09-30 实测）。
 		if resetAt, ok := upstream.ParseRateReset(body); ok {
 			if upstream.IsModelRateLimit(body) {
 				h.cfg.Pool.CooldownSoftForModel(uid, h.cfg.SoftCooldown, resetAt, model, "6004 model rate limit")
 				return
 			}
-			h.cfg.Pool.CooldownSoftRate(uid, h.cfg.SoftCooldown, resetAt, "429 rate limit")
+			h.cfg.Pool.CooldownSoftRateReset(uid, h.cfg.SoftCooldown, resetAt, "429 rate limit")
 			return
 		}
 		// P1-2：body 无重置文案但带 Retry-After 头 → 冷却到该时刻（不做指数堆加，
@@ -916,10 +1066,11 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// passthrough 首遇由 chatCompletions 内降级重试处理；最终仍拦则回 400
 		// content_blocked（防火墙文案），不再轮转、不暴露账号/冷却/错误码。
 	case upstream.ErrBadParams:
-		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
-		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，
-		// 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇）；但**仍然轮转**
-		// ——不同账号可能有不同的模型权限，值得换号再试一次。
+		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）或模型拒绝请求参数
+		// （11133 model_param_invalid）：发给上游的 body 有问题（网关截断已由 413 消灭，
+		// 剩余为客户端畸形 JSON 或不受该模型支持的参数组合）。换号照样 400，不罚账号
+		// （无冷却/熔断/NoteError，同 ErrContentBlocked 待遇），且**不轮转**——出站 body
+		// 除缓存键外与账号无关，轮转必然同结果（2026-10-01 实测 3 号全拒）。
 	case upstream.ErrModelBlocked:
 		// 11102「该后端无此模型」：(账号, 模型) 负缓存避让。复用 modelCooldowns 机制
 		// （与 6004 同域），写 modelCooldowns[model]，Until 为指数退避 TTL（6h 起、封顶

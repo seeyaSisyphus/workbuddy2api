@@ -2,6 +2,7 @@
 package pool
 
 import (
+	"fmt"
 	"log"
 	"math"
 	"math/rand/v2"
@@ -33,8 +34,9 @@ func (p *Pool) Pick(model string) *auth.Auth {
 // minPickGap=0（测试用）时过滤恒通过，退化为纯加权随机。
 // reqModel 非空时把健康口径换成 healthyForModel（6004 模型豁免生效；PickExcluding 传 ""）。
 // realm 非空时候选过滤叠加 Realm()==realm 谓词（分池选号域；PickExcluding 传 ""）。
-// 注意：模型豁免只进 normal 选号（候选 healthy 判定）；全冷却兜底不参与模型豁免——
-// 兜底本来就是在"无任何 direct 可用"时的降级，切模型可用性已在 normal 阶段体现。
+// 注意：模型豁免只进 normal 选号（候选 healthy 判定）；全冷却兜底**反而显式排除**在
+// reqModel 上被上游拒过（6004 配额 / 11102 负缓存）且未到恢复时刻的账号——上游已承诺
+// 恢复时刻，兜底提前探测必然失败，只会白烧配额。切模型的可用性已在 normal 阶段体现。
 func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -63,8 +65,40 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	}
 	if len(cands) == 0 {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
-		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
-		return p.pickEarliestExpiryLocked(tried, now, realm)
+		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底；
+		// reqModel 上被上游拒过（6004/11102）且未到恢复时刻的账号同样排除。
+		return p.pickEarliestExpiryLocked(tried, now, realm, reqModel)
+	}
+	// 第 0 层（积分底线，硬过滤，先于一切分层）：credits < lowCreditStop 的候选跳过——
+	// 余额见底的号继续打只会撞 402 硬冷却到次日 04:00。豁免两种：
+	//  1. creditsExpiring >= stop（快过期的分不用白不用，作废前烧掉比保住本金更值）；
+	//  2. 该号对请求模型持有有效「实测免费」观测（成本账本 tier 0）——限免期请求不耗
+	//     积分，底线前提不成立；观测 6h TTL 过期或限免结束（首次收费观测灌入 EMA 把
+	//     CostPer1k 拉离 0）后豁免自动失效，无需人工摘除。
+	// 豁免按（账号, 模型）各自判定，不用池级证据：限免若实为部分账号专享，池级豁免会
+	// 把没份的低余额号放出去白烧到 402 硬冷却。
+	// 若过滤后无候选 → 跳过本层降级使用全部候选（weightOf 会自然偏好高余额号），记 WARN 暴露。
+	// 兜底路径（pickEarliestExpiryLocked）不套本层：它已排除 CoolHard（余额耗尽）号，
+	// 其余冷却中的低余额号只是"无健康号时的降级探测"，一次探测的成本远小于无号可服务的损失。
+	if p.lowCreditStop > 0 {
+		// freeObserved 该号对请求模型的实测免费观测仍有效（成本账本 tier 0）。
+		// modelCostOf 对空 reqModel 恒 false，非模型感知路径不触发本豁免。
+		freeObserved := func(e *entry) bool {
+			mc, ok := e.modelCostOf(reqModel, now)
+			return ok && mc.CostPer1k <= 0
+		}
+		kept := cands[:0]
+		for _, e := range cands {
+			if e.credits < p.lowCreditStop && e.creditsExpiring < p.lowCreditStop && !freeObserved(e) {
+				continue
+			}
+			kept = append(kept, e)
+		}
+		if len(kept) > 0 {
+			cands = kept
+		} else {
+			log.Printf("WARN: [pool] low_credit_stop=%d 过滤后无候选（%d 个全部低于底线），跳过底线层降级使用", p.lowCreditStop, len(cands))
+		}
 	}
 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿 + 成功率
 	// 根本进不了短名单决策，低 credits 但高成功率/久置的账号会永远排不进 top5。
@@ -77,6 +111,41 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		if e.credits > maxCredits {
 			maxCredits = e.credits
 		}
+	}
+	// maxExpiring 快过期积分的全集最大值（同上全集口径），供 expiring 权重项归一化。
+	// 用**绝对量**而非"占比"：占比会让"100 分里 90 分快过期"压过"10000 分里 5000 分
+	// 快过期"，而后者作废的绝对损失大 50 倍；选号目标是让快作废的积分尽量被用掉。
+	var maxExpiring int64
+	for _, e := range cands {
+		if e.creditsExpiring > maxExpiring {
+			maxExpiring = e.creditsExpiring
+		}
+	}
+	// 快过期分层（最高优先级，硬过滤）：有快过期积分的账号整体优先于没有的账号——
+	// 快过期积分不用就作废，必须先消耗；等它们清零后（NoteModelCost 随消耗递减 /
+	// 定期刷新回写）本层自然消失，选号回落到按积分总量的常规口径。
+	// 这是**外层**分层：外层决定"是否在消耗快过期积分"，内层 costTier 决定
+	// "同层内优先免费"，两者正交（见下）。
+	expiringTier := func(e *entry) int {
+		if e.creditsExpiring > 0 {
+			return 0
+		}
+		return 1
+	}
+	bestExp := 1
+	for _, e := range cands {
+		if t := expiringTier(e); t < bestExp {
+			bestExp = t
+		}
+	}
+	if bestExp == 0 {
+		kept := cands[:0]
+		for _, e := range cands {
+			if expiringTier(e) == 0 {
+				kept = append(kept, e)
+			}
+		}
+		cands = kept
 	}
 	// 权重与成本分层**各算一次、全程复用**（weighted 结构体定义见包级注释）：
 	// weightOf 每候选一次（预计算存入 ws.w），costTier/modelCostOf 同样每候选一次
@@ -111,7 +180,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	for _, e := range cands {
 		ti, ci := costTier(e)
 		if ti == bestTier {
-			ws = append(ws, weighted{e: e, w: p.weightOf(e, maxCredits, now), tier: ti, cost1k: ci})
+			ws = append(ws, weighted{e: e, w: p.weightOf(e, maxCredits, maxExpiring, now), tier: ti, cost1k: ci})
 		}
 	}
 	// 等权重洗牌：仅当存在权重并列（epsilon 比较，防浮点微差让洗牌静默失效）且
@@ -185,14 +254,57 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	e.lastUsed = now // 锁内即时标记：下一个进入 pick 的 goroutine 立即看到本号已用
 	p.pickSeq++
 	e.usedSeq = p.pickSeq // 单调序号：保证 usedSeq 严格全序（防惊群/LRU 的权威依据）
+	p.notePickLocked(e, now)
 	return e.a
 }
 
+// notePickLocked 速率调度记账（防"单号被本地调度打太多"）：窗口内被选中达到上限时
+// 置 CoolRate 冷却，冷却期内该号不参与选号（也不参与全冷却兜底探测，见
+// pickEarliestExpiryLocked）——把负载摊给其它号，而不是把某一个号刷成风控样本。
+//
+// 记账范围：normal 选号（pick）与粘性命中（PickByUIDForModel）都算"一次选中"；
+// 兜底探测（pickEarliestExpiryLocked）不记账——它本来就是"无健康号"时的降级，
+// 且速率冷却号已被排除在兜底之外，不会形成自激。
+//
+// 窗口语义（配额制，非滑动窗）：一个窗口内累计 rateLimit 次选中即冷却 rateCooldown，
+// **打满时窗口一并清零**——解冻后从零开始重新攒配额。若不清零，解冻时窗口往往尚未
+// 过期（rateCooldown < rateWindow 时必然如此），hotCount 仍是 rateLimit，解冻后第一次
+// 被选中就立刻再次打满 → 实际锁定时长变成"冷却 + 等到窗口过期"（最坏 rateCooldown +
+// rateWindow），配置给出的容量根本兑现不了。2026-09-29 的池子被打空即由此放大。
+// 调用方必须已持有 p.mu 写锁。
+func (p *Pool) notePickLocked(e *entry, now time.Time) {
+	if p.rateLimit <= 0 || p.rateWindow <= 0 || p.rateCooldown <= 0 {
+		return
+	}
+	if e.hotWindowStart.IsZero() || now.Sub(e.hotWindowStart) >= p.rateWindow {
+		e.hotWindowStart = now
+		e.hotCount = 0
+	}
+	e.hotCount++
+	if e.hotCount < p.rateLimit {
+		return
+	}
+	e.until = now.Add(p.rateCooldown)
+	e.coolKind = CoolRate
+	e.reason = fmt.Sprintf("rate schedule: picked %d times within %s, cooled %s", p.rateLimit, p.rateWindow, p.rateCooldown)
+	e.hotWindowStart = time.Time{} // 打满即清窗：解冻后重新攒配额（见上方"窗口语义"）
+	e.hotCount = 0
+	p.dirty.Store(true)
+}
+
 // pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
-// 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
+// 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）排除——调了必 402，浪费轮换并产生噪音日志；
+// CoolRate（本地速率冷却）同样排除——兜底探测会立刻给"刚被打太多"的号再加一次上游调用，
+// 与限速目标相反（宁可快速 503，让 failgate 退避）。
+// reqModel 对该模型处于冷却（6004 配额 / 11102 负缓存）的账号同样排除——上游已给出权威
+// 恢复时刻，提前探测必然失败，只会白烧配额并给风控送样本。**注意这与"模型豁免"是两回事**：
+// 模型豁免作用在 normal 选号（healthyForModel 让该号对其它模型仍可用），兜底这里排的是
+// "本请求这个模型上明确被上游拒过"的号。
+// 实现提示：模型级冷却只写 modelCooldowns、不写 e.until，故下方 expiry() 为零值也会跳过；
+// 但**账号级冷却 + 模型级冷却并存**时 expiry() 非零，必须靠本显式判断拦住（否则照样撞 6004）。
 // CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
-func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm string) *auth.Auth {
+func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm, reqModel string) *auth.Auth {
 	var best *entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
@@ -204,8 +316,11 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		if e.disabled {
 			continue // 禁用的账号永不参与兜底
 		}
-		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
-			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
+		if (e.coolKind == CoolHard || e.coolKind == CoolRate) && !e.until.IsZero() && now.Before(e.until) {
+			continue // 余额耗尽号（调了必 402）与速率冷却号（本地限速）不参与兜底
+		}
+		if e.modelCooled(now, reqModel) {
+			continue // 该模型被上游拒过且未到恢复时刻：探测必失败
 		}
 		if p.inFlightFull(e) {
 			continue
@@ -308,9 +423,11 @@ func (p *Pool) pickWeighted(cands []weighted) *entry {
 // 位级相等，精确相等比较会让等权重洗牌静默失效、回到字典序截断饿死问题。
 const weightEpsilon = 1e-9
 
-// weightOf 计算单个账号的三因子权重。单次 pick 内对每个候选只调用一次
+// weightOf 计算单个账号的选号权重。单次 pick 内对每个候选只调用一次
 // （预计算存入 weighted.w，sort 比较器与 pickWeighted 均读缓存不重算）。
-func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
+// maxCredits / maxExpiring 均为**全集口径**（tier 过滤前的全部 healthy 候选），
+// 保证截断排序与抽签权重共享同一基准。
+func (p *Pool) weightOf(e *entry, maxCredits, maxExpiring int64, now time.Time) float64 {
 	if p.weightOfHook != nil {
 		p.weightOfHook() // DeptestOnly 观测：验证单次 pick 只算一次
 	}
@@ -323,11 +440,13 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 		w += float64(e.credits) / float64(maxCredits) * 10
 	}
 	// 1b. 快过期积分加成（issue:积分过期）：官方活动赠送的奖励积分按批过期，
-	// 不用就作废。creditsExpiring 占总量比例越高，越应优先被消耗——把"快过期
-	// 占比"作为一个独立的强权重项（×expiringWeight），让快过期积分多的号优先选。
-	// 与成本分层（costTier 优先免费）正交：那是按"实测扣费"分层，这是按"过期紧迫度"。
-	if e.credits > 0 && e.creditsExpiring > 0 {
-		w += float64(e.creditsExpiring) / float64(e.credits) * expiringWeight
+	// 不用就作废。快过期积分多的号更该被选中，尽快把要作废的部分消耗掉。
+	// 用**绝对量**（creditsExpiring / 全集 maxExpiring ×expiringWeight）而非占总量
+	// 比例：占比会让"100 分里 90 分快过期"压过"10000 分里 5000 分快过期"，
+	// 而后者要作废的绝对损失大 50 倍——目标是最小化作废积分绝对值。
+	// 外层 expiringTier 已保证"有快过期积分的号整体优先"，本项在同层内排序。
+	if e.creditsExpiring > 0 && maxExpiring > 0 {
+		w += float64(e.creditsExpiring) / float64(maxExpiring) * expiringWeight
 	}
 	// 2. 闲置补偿。
 	if e.lastUsed.IsZero() {

@@ -90,6 +90,29 @@ func (p *Pool) ReenableIfCredits(uid string, remain int64) {
 	}
 }
 
+// ReviveIfCreditExhausted 定向解冻（定期余额探测路径专用）：仅当账号处于 CoolHard
+// （余额耗尽）且探测到余额恢复（remain>0）时清冷却域，其余冷却一律不动。
+//
+// 与 ReenableIfCredits（签到解冻，全量清冷却域）的分野：余额探测是**只读观测**，
+// 不是"账号已恢复"的证据。若探测也走全量解冻，10 分钟一次的刷新会把 429 软冷却、
+// WAF 冷却与 6004 模型级冷却一并抹掉——已限流的号被反复重打（6004 冷却形同虚设，
+// 持续给上游风控送样本）。定向路径只解"余额不足"这一种由余额自证恢复的冷却。
+// 余额一并回写（与 ReenableIfCredits 同构：探测到的余额总是写入）；禁用账号只回写
+// 余额、不解冻（授权终态，需 ReviveDisabled/重登）；不存在 uid：空操作。
+func (p *Pool) ReviveIfCreditExhausted(uid string, remain int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	e.credits = remain
+	if !e.disabled && remain > 0 && e.coolKind == CoolHard && !e.until.IsZero() && time.Now().Before(e.until) {
+		p.reviveCoolingLocked(e, remain)
+	}
+	p.dirty.Store(true)
+}
+
 // NoteError 记录一次错误：喂入唯一的连续失败计数器 fails + 累计错误 errTotal，
 // 并拉高 errorEMA（成功率权重的衰减口径）。达到 breakerThreshold 触发熔断（指数
 // 退避），连续失败语义整体并入熔断器（不再有独立的 err 冷却）。
@@ -143,9 +166,9 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 		per1k = 0
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
 	if !ok {
+		p.mu.Unlock()
 		return
 	}
 	// P1-A credits 签到外回写：credit 是本次请求的**消耗量**（上游 usage.credit，
@@ -155,7 +178,9 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 	// 高权重直到打空撞 402；global 账号不签到，credits 曾是终身冻结。
 	// 签到仍定期覆盖（ReenableIfCredits/SetCreditsDetailed 以 authoritative 余额
 	// 重置），扣减只是两次签到之间的内插估计；credit=0（免费请求）不动余额。
+	crossed := false
 	if credit > 0 {
+		prev := e.credits
 		d := int64(credit + 0.5) // 四舍五入，与测试口径一致（2.5 → 3）
 		if d > e.credits {
 			d = e.credits // 钳 0：扣穿（对账延迟/消费早于记账）不产生负余额
@@ -167,6 +192,9 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 			}
 			e.creditsExpiring -= d
 		}
+		// 下行跨越低余额加速阈值（边缘触发：跌破后再次扣减不重复触发，
+		// 探测回写升回阈值之上后再次跌破才会重新触发）。回调在锁外调用。
+		crossed = p.lowCreditAccel > 0 && prev >= p.lowCreditAccel && e.credits < p.lowCreditAccel
 	}
 	if e.modelCost == nil {
 		e.modelCost = make(map[string]modelCostEntry)
@@ -181,6 +209,11 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 			LastSeen:  time.Now(),
 			Samples:   prev.Samples + 1,
 		}
+	}
+	probe := p.lowCreditProbe
+	p.mu.Unlock()
+	if crossed && probe != nil {
+		probe(uid)
 	}
 }
 
@@ -226,6 +259,31 @@ func (p *Pool) AuthByUID(uid string) *auth.Auth {
 		return e.a
 	}
 	return nil
+}
+
+// LowCreditActiveUIDs 返回 credits < threshold 且近 window 内被选中过（lastUsed）的
+// 非禁用账号，按 UID 排序（稳定输出）。供积分刷新加速档只刷活跃低余额号；
+// threshold<=0 时恒空（加速档关闭）。会话绑定维度由调用方（scheduler 经 SessionBound
+// 回调）补充——pool 不感知 session 层。
+func (p *Pool) LowCreditActiveUIDs(threshold int64, window time.Duration) []string {
+	if threshold <= 0 {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	var uids []string
+	for uid, e := range p.byUID {
+		if e.disabled || e.credits >= threshold {
+			continue
+		}
+		if e.lastUsed.IsZero() || now.Sub(e.lastUsed) > window {
+			continue
+		}
+		uids = append(uids, uid)
+	}
+	sort.Strings(uids)
+	return uids
 }
 
 // AvailableUIDs 返回当前 healthy 且未占满在途名额的账号 UID 列表（按 UID 排序，稳定输出）。
@@ -295,6 +353,11 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	// （entry.usedSeq 注释声明「每次被选中时取 pickSeq 自增值」，粘性命中也是选中）。
 	p.pickSeq++
 	e.usedSeq = p.pickSeq
+	// 速率调度同样记账：粘性命中也是"一次选中"（且是最容易形成单号独食的路径——
+	// 会话被钉在同一个号上，请求会持续集中）。漏记会让被钉住的号绕过限速，
+	// 恰是"单号被打太多→上游风控"的高危形态。冷却后本函数返回 nil，
+	// handler 随即解绑粘性并回落普通轮换（负载自动摊开）。
+	p.notePickLocked(e, now)
 	return e.a
 }
 
@@ -365,6 +428,59 @@ func (p *Pool) ServableForRealm(realm string) bool {
 	return p.servableLocked(realm)
 }
 
+// NextUsableIn 返回该 realm 下、指定模型最早可能恢复可服务的等待时长：
+//   - 0     ：现在就有可服务账号（healthyForModel 且未占满在途）
+//   - d > 0 ：当前不可用，但预计 d 后至少一个账号会解除冷却/熔断；
+//             账号级 until、熔断 breakerUntil、该模型 6004 冷却取**最晚**者
+//   - ok=false：该域内没有任何非禁用账号（等多久都没用）
+//
+// 供 handler 在"无可用账号"出口生成 Retry-After 提示：把"什么时候再来"告诉
+// 客户端，避免客户端在无信息的情况下按秒空转（重试风暴放大器之一）。
+// model=="" 时不看模型级冷却（只按账号级健康口���）。调用方必须不持锁。
+func (p *Pool) NextUsableIn(model, realm string) (time.Duration, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	var best time.Duration
+	haveAny := false
+	haveDeadline := false
+	for _, e := range p.byUID {
+		if e.disabled {
+			continue
+		}
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		haveAny = true
+		if e.healthyForModel(now, model) {
+			// 健康号视为立即可用；在途占满只差一个很短的名额释放窗口，
+			// 同样按"马上可用"处理（调用方负责把提示钳到 >=1s）。
+			return 0, true
+		}
+		t := e.until
+		if e.breakerUntil.After(t) {
+			t = e.breakerUntil
+		}
+		if model != "" {
+			if mc, ok := e.modelCooldowns[model]; ok && mc.Until.After(t) {
+				t = mc.Until
+			}
+		}
+		var d time.Duration
+		if t.After(now) {
+			d = t.Sub(now)
+		}
+		if !haveDeadline || d < best {
+			best = d
+			haveDeadline = true
+		}
+	}
+	if !haveAny {
+		return 0, false
+	}
+	return best, true
+}
+
 // servableLocked 是 ServableNow / ServableForRealm 共用的遍历实现：
 // 存在至少一个（realm 匹配、未占满在途名额、healthy 或模型豁免形态）的账号即 true。
 // realm=="" 不加 realm 谓词（全池）。调用方必须不持锁。
@@ -416,6 +532,8 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Realm:             e.a.Realm(),
 		Nickname:          e.a.Nickname,
 		Credits:           e.credits,
+		CreditsExpiring:   e.creditsExpiring,
+		LowBalance:        p.lowCreditStop > 0 && e.credits < p.lowCreditStop,
 		Cooling:           now.Before(e.until) || now.Before(e.breakerUntil),
 		Reason:            reason,
 		Disabled:          e.disabled,

@@ -3,6 +3,7 @@ package main
 import (
 	"reflect"
 	"testing"
+	"time"
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
@@ -20,7 +21,7 @@ func realmPool(t *testing.T) *pool.Pool {
 }
 
 // TestRealmAwareAvailableForModel 断言会话粘性的 realm 感知闭包：
-// 带前缀的模型名按 realm 过滤可用账号，裸名走 cn。
+// 带前缀的模型名按 realm 过滤可用账号，裸名走 cn；同义前缀 g: 与别名层同口径。
 func TestRealmAwareAvailableForModel(t *testing.T) {
 	p := realmPool(t)
 	fn := realmAwareAvailableForModel(p)
@@ -32,11 +33,44 @@ func TestRealmAwareAvailableForModel(t *testing.T) {
 		{"glm-5.2", []string{"cn1"}},           // 裸名 → cn 集合
 		{"cn:glm-5.2", []string{"cn1"}},        // 显式 cn 前缀 → cn 集合
 		{"global:gpt-5.4", []string{"g1"}},     // global 前缀 → global 集合
+		{"g:gpt-5.4", []string{"g1"}},          // 同义前缀 g: → global 集合
+		{"deepseek-flash", []string{"cn1"}},    // 裸别名 → cn 集合
+		{"cn:deepseek-flash", []string{"cn1"}}, // cn + 别名 → cn 集合
+		{"g:deepseek-flash", []string{"g1"}},   // g: + 别名 → global 集合
+		{"global:deepseek-flash", []string{"g1"}},
+		// 大小写不敏感：前缀层与模型名层都折叠，结论与规范拼写一致
+		{"G:gpt-5.4", []string{"g1"}},
+		{"GLOBAL:gpt-5.4", []string{"g1"}},
+		{"CN:glm-5.2", []string{"cn1"}},
+		{"GLM-5.3", []string{"cn1"}},
+		{"G:Deepseek-Flash", []string{"g1"}},
 	}
 	for _, c := range cases {
 		if got := fn(c.model); !reflect.DeepEqual(got, c.want) {
 			t.Errorf("AvailableForModel(%q)=%v want %v", c.model, got, c.want)
 		}
+	}
+}
+
+// TestRealmAwareAvailableForModelAliasReachesPoolKey 别名必须落到 pool 的模型键上
+// （否则粘性可用集合与选号集合会错配）：把 g1 对**别名目标**做 6004 模型级冷却后，
+// 用别名拼写请求该模型应不可用，而其他模型不受影响。
+func TestRealmAwareAvailableForModelAliasReachesPoolKey(t *testing.T) {
+	p := realmPool(t)
+	fn := realmAwareAvailableForModel(p)
+
+	p.CooldownSoftForModel("g1", time.Minute, time.Now().Add(time.Minute), "deepseek-v4.1-flash", "6004 model rate limit")
+
+	if got := fn("g:deepseek-flash"); len(got) != 0 {
+		t.Errorf("别名未落到 pool 键：AvailableForModel(g:deepseek-flash)=%v want empty（g1 对别名目标已 6004 冷却）", got)
+	}
+	if got := fn("g:other-model"); !reflect.DeepEqual(got, []string{"g1"}) {
+		t.Errorf("AvailableForModel(g:other-model)=%v want [g1]（冷却只应作用于该模型）", got)
+	}
+	// 大小写变体拼写必须落到同一个 pool 键：否则大写拼写的失败避让永远避不开
+	// （冷却键写 `deepseek-v4.1-flash`、请求键用 `G:DeepSeek-Flash` 就错配）。
+	if got := fn("G:DeepSeek-Flash"); len(got) != 0 {
+		t.Errorf("大小写变体未归一到 pool 键：AvailableForModel(G:DeepSeek-Flash)=%v want empty", got)
 	}
 }
 
@@ -50,9 +84,12 @@ func TestRealmAwareAvailableForModelGlobalDisabled(t *testing.T) {
 	p.Add(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai"})
 	fn := realmAwareAvailableForModel(p)
 
-	// 开关关闭 → 该 global 账号 Realm()=="cn"（逃生门），对 global: 前缀不可见。
-	if got := fn("global:gpt-5.4"); len(got) != 0 {
-		t.Errorf("global disabled: AvailableForModel(global:gpt-5.4)=%v want empty", got)
+	// 开关关闭 → 该 global 账号 Realm()=="cn"（逃生门），对 global: / 同义 g: 前缀均不可见
+	// （含大小写变体：前缀折叠后仍归 global，逃生门不能因大小写被绕过）。
+	for _, m := range []string{"global:gpt-5.4", "g:gpt-5.4", "G:gpt-5.4", "GLOBAL:gpt-5.4"} {
+		if got := fn(m); len(got) != 0 {
+			t.Errorf("global disabled: AvailableForModel(%q)=%v want empty", m, got)
+		}
 	}
 	// 裸名 → cn：该账号被当作 cn 可见（现状等价，纯 CN 锁定）。
 	if got := fn("glm-5.2"); !reflect.DeepEqual(got, []string{"g1"}) {

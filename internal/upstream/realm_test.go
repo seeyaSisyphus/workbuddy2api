@@ -120,6 +120,39 @@ func TestGlobalChatFallsBackToV2Path(t *testing.T) {
 		t.Errorf("chat fallback calls=%v want [console, v2]", calls)
 	}
 }
+// TestGlobalChatFallsBackToV2On403 断言 /console 遇到 403（WAF 拦截页）时，自动 fallback 到 /v2/chat/completions。
+func TestGlobalChatFallsBackToV2On403(t *testing.T) {
+	var calls []string
+	chatSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.URL.Path)
+		if r.URL.Path == "/console/chat/completions" {
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(403)
+			_, _ = w.Write([]byte(`<!DOCTYPE html><html><head><title>WAF Block Page</title></head></html>`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer chatSrv.Close()
+	billSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
+	}))
+	defer billSrv.Close()
+
+	c := globalTestClient(t, chatSrv, billSrv)
+	rc, status, _, err := c.ChatStream(globalAcct(), []byte(`{"model":"deepseek-v4.1-flash","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}]}`), "", ChatMeta{})
+	if err != nil || status != 200 {
+		t.Fatalf("chat fallback on 403: status=%d err=%v", status, err)
+	}
+	rc.Close()
+	if len(calls) != 2 || calls[0] != "/console/chat/completions" || calls[1] != "/v2/chat/completions" {
+		t.Errorf("chat fallback calls=%v want [console, v2]", calls)
+	}
+}
+
 
 // TestGlobalBillingUsesBillingMeterThenV2Fallback 断言 global billing 先打 /billing/meter/*
 // 404 时 fallback /v2/billing/meter/*；CN billing 直接 /v2/billing/meter/*（现状逐字）。

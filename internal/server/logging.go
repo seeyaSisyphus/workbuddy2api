@@ -194,9 +194,6 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 		return
 	}
 	seq := chatSeq.Add(1)
-	if len(model) > 11 {
-		model = model[:11]
-	}
 	tokField := "-"
 	tokpsField := "-"
 	if toks >= 0 {

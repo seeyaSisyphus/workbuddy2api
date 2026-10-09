@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand/v2"
+	"sort"
 	"sync"
 	"time"
 
@@ -47,6 +48,16 @@ type Config struct {
 	// CreditRefresh 定期刷新全账号余额 + 快过期额度的周期；<=0 = 关闭
 	// （只在签到时刷新，行为与引入前一致）。
 	CreditRefresh time.Duration
+	// CreditRefreshLow 低余额加速档刷新周期：存在活跃低余额号（见 LowCreditAccel）
+	// 时按此周期只刷这些号；<=0 = 无加速档（恒按 CreditRefresh 全量刷新）。
+	CreditRefreshLow time.Duration
+	// LowCreditAccel 低余额加速阈值：活跃号（近 lowCreditActiveWindow 被选中或被
+	// 会话绑定）credits 低于此值时刷新切加速档；逐请求扣费跌破此值时经
+	// ScheduleLowCreditProbe 触发一次单号延迟探测。<=0 = 关闭加速档与事件探测。
+	LowCreditAccel int64
+	// SessionBound 返回当前被会话粘性绑定的账号集合（session.Router.BoundUIDs）；
+	// nil = 无会话维度（活跃判定只看 lastUsed）。
+	SessionBound func() map[string]bool
 
 	// HistoryFile 积分快照 JSONL 落盘路径（空 = 不记录，零改动现状）。
 	// 记录每账号一次余额观测（签到 kind=checkin / 刷新 kind=probe），
@@ -90,6 +101,10 @@ type Scheduler struct {
 
 	// checkinMu 串行化签到：定时入口与手动触发互斥，避免同一时刻重复打上游签到接口。
 	checkinMu sync.Mutex
+
+	// probeMu/probePending 低余额事件探测的同号去重：延迟窗口内同号重复触发跳过。
+	probeMu      sync.Mutex
+	probePending map[string]bool
 }
 
 // New 构建。
@@ -116,8 +131,15 @@ func New(cfg Config) *Scheduler {
 	if cfg.ActivityReportCount <= 0 {
 		cfg.ActivityReportCount = 1
 	}
-	return &Scheduler{cfg: cfg, adoptTried: make(map[string]string), rewardClaimed: make(map[string]string)}
+	return &Scheduler{cfg: cfg, adoptTried: make(map[string]string), rewardClaimed: make(map[string]string), probePending: make(map[string]bool)}
 }
+
+// lowCreditProbeDelay 事件探测延迟：扣费记账后稍等片刻再探测，避开上游入账延迟。
+const lowCreditProbeDelay = 15 * time.Second
+
+// lowCreditActiveWindow 活跃判定窗口：近 10 分钟内被选中过的号才算活跃
+// （会话绑定维度由 SessionBound 补充，不看窗口）。
+const lowCreditActiveWindow = 10 * time.Minute
 
 // checkinRefreshSkew 签到前判定"token 是否临近过期"的时间窗口（10 分钟）。
 // 长时间停机/容器长期停跑后 access token 往往已过期，不先刷新则签到必然 401 白跑。
@@ -479,63 +501,174 @@ func (s *Scheduler) recordHistory(kind history.Kind, uid string, remain int64) {
 	}
 }
 
-// runCreditRefreshLoop 按 CreditRefresh 周期循环刷新全账号余额，ctx 取消即退出。
-// 启动后先等一个周期再刷新（首轮由 CheckinAll 或进程启动时的余额探测覆盖，
-// 无需立刻重复打上游）；周期 <=0 时本函数不会被调用。
+// runCreditRefreshLoop 自适应周期刷新余额，ctx 取消即退出。
+// 正常档按 CreditRefresh 周期全量刷新；存在活跃低余额号（lowCreditActiveUIDs 非空）
+// 且配置了 CreditRefreshLow 时切加速档：按 CreditRefreshLow 周期只刷这些号，
+// 低余额号全部脱离阈值后自动回到正常档。启动后先等一个周期再刷新（首轮由
+// CheckinAll 或进程启动时的余额探测覆盖，无需立刻重复打上游）；
+// 周期 <=0 时本函数不会被调用。
 func (s *Scheduler) runCreditRefreshLoop(ctx context.Context) {
-	t := time.NewTicker(s.cfg.CreditRefresh)
-	defer t.Stop()
+	timer := time.NewTimer(s.cfg.CreditRefresh)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-timer.C:
+		}
+		interval := s.cfg.CreditRefresh
+		if low := s.lowCreditActiveUIDs(); len(low) > 0 && s.cfg.CreditRefreshLow > 0 {
+			s.runCreditRefreshFor(low)
+			interval = s.cfg.CreditRefreshLow
+		} else {
 			s.RunCreditRefreshNow()
 		}
+		timer.Reset(interval)
 	}
+}
+
+// lowCreditActiveUIDs 当前需要加速刷新的账号：credits < LowCreditAccel 且活跃
+// （近 lowCreditActiveWindow 被选中过，或被会话绑定）。LowCreditAccel<=0 时恒空。
+func (s *Scheduler) lowCreditActiveUIDs() []string {
+	if s.cfg.LowCreditAccel <= 0 {
+		return nil
+	}
+	set := map[string]bool{}
+	for _, uid := range s.cfg.Pool.LowCreditActiveUIDs(s.cfg.LowCreditAccel, lowCreditActiveWindow) {
+		set[uid] = true
+	}
+	if s.cfg.SessionBound != nil {
+		for uid := range s.cfg.SessionBound() {
+			if set[uid] {
+				continue
+			}
+			if st, ok := s.cfg.Pool.Status(uid); ok && !st.Disabled && st.Credits < s.cfg.LowCreditAccel {
+				set[uid] = true
+			}
+		}
+	}
+	uids := make([]string, 0, len(set))
+	for uid := range set {
+		uids = append(uids, uid)
+	}
+	sort.Strings(uids)
+	return uids
+}
+
+// runCreditRefreshFor 加速档定向刷新：只探测指定的活跃低余额号并回写池。
+func (s *Scheduler) runCreditRefreshFor(uids []string) {
+	okN := 0
+	for _, uid := range uids {
+		if probed, _ := s.refreshAccountCredits(uid); probed {
+			okN++
+		}
+	}
+	log.Printf("credit refresh (low-credit accel): targeted=%d ok=%d", len(uids), okN)
+}
+
+// ScheduleLowCreditProbe 低余额事件回调（main 装配时经 Pool.SetLowCreditProbeFunc 注入）：
+// NoteModelCost 扣费使 credits 下行跌破 LowCreditAccel 时触发，延迟 lowCreditProbeDelay
+// 对该号做一次单号余额探测（refreshAccountCredits 会先补 token 再探测）。
+// 延迟窗口内同号重复触发去重；探测本身是只读观测，失败只记 WARN。
+func (s *Scheduler) ScheduleLowCreditProbe(uid string) {
+	if uid == "" || s.cfg.LowCreditAccel <= 0 {
+		return
+	}
+	s.probeMu.Lock()
+	if s.probePending[uid] {
+		s.probeMu.Unlock()
+		return
+	}
+	s.probePending[uid] = true
+	s.probeMu.Unlock()
+	time.AfterFunc(lowCreditProbeDelay, func() {
+		s.probeMu.Lock()
+		delete(s.probePending, uid)
+		s.probeMu.Unlock()
+		s.refreshAccountCredits(uid)
+	})
 }
 
 // RunCreditRefreshNow 立即刷新池内所有账号的余额与快过期额度，回写池供选号使用。
 //
-// 与签到的差别：**不**调 daily-checkin、**不**碰 token（只读余额），因此可以
-// 高频跑；global 账号同样跳过（无 CN 那套 billing 资源口径），禁用/无凭证账号跳过。
-// 单账号失败只记 WARN 不影响其余账号——刷新是尽力而为的观测，不是任务执行。
+// 与签到的差别：**不**调 daily-checkin；除低余额号外**不**碰 token（只读余额），因此可以
+// 高频跑；禁用/无凭证账号跳过。单账号失败只记 WARN 不影响其余账号——刷新是尽力而为
+// 的观测，不是任务执行。低余额号（credits < LowCreditAccel）token 过期时先刷 token
+// 再探测（refreshAccountCredits），底线判断不能拿死数据。
 func (s *Scheduler) RunCreditRefreshNow() {
 	statuses := s.cfg.Pool.List()
 	var okN, failN, skipN int
 	for _, st := range statuses {
-		if st.Disabled {
+		probed, skipped := s.refreshAccountCredits(st.UID)
+		switch {
+		case probed:
+			okN++
+		case skipped:
 			skipN++
-			continue
-		}
-		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.AccessToken == "" {
-			skipN++
-			continue
-		}
-		// 余额是只读观测：token 过期时静默跳过（不刷新 token、不算失败），
-		// 刷新 token 是注册/签到路径的职责，避免这里与它们抢写 auths 文件。
-		if a.NeedsRefresh(0) {
-			skipN++
-			continue
-		}
-		// global 与 CN 的余额口径由 billingMeterPaths/UserResourceDetailed 内部按 realm
-		// 分流（global → /billing/meter/*，CN → /v2/...；解析回退 CapacityRemain 覆盖
-		// global 的 Free Plan 套餐），调用方无需区分——global 账号同样纳入定期刷新。
-		remain, buckets, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
-		if err != nil {
-			log.Printf("credit refresh %s: %v", logfmt.UID8(st.UID), err)
+		default:
 			failN++
-			continue
 		}
-		// 恢复判定放在置数之前：与签到路径同序（ReenableIfCredits 依赖旧余额做迟滞）。
-		s.cfg.Pool.ReenableIfCredits(st.UID, remain)
-		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, buckets.Expiring)
-		// 积分快照：非签到的普通余额探测，供日报回填基线。
-		s.recordHistory(history.Probe, st.UID, remain)
-		okN++
 	}
 	log.Printf("credit refresh done: total=%d ok=%d fail=%d skipped=%d", len(statuses), okN, failN, skipN)
+}
+
+// refreshAccountCredits 探测单账号余额并回写池：ReviveIfCreditExhausted（只解 CoolHard）
+// + SetCreditsDetailed + 历史快照。返回 (probed, skipped)：probed=成功探测回写；
+// skipped=不适用（禁用/无凭证/token 过期且非低余额号）；两者皆 false = 探测失败。
+//
+// token 过期处理：余额是只读观测，普通号 token 过期时静默跳过（刷新 token 是注册/签到/
+// keepalive 路径的职责，避免这里与它们抢写 auths 文件）。**例外**：余额低于
+// LowCreditAccel 的号先刷 token 再探测——底线/加速档判断若拿死数据，低余额号会被
+// 静默跳过而永远等不到余额恢复（或误判余额充足继续打）。
+func (s *Scheduler) refreshAccountCredits(uid string) (probed, skipped bool) {
+	st, ok := s.cfg.Pool.Status(uid)
+	if !ok || st.Disabled {
+		return false, true
+	}
+	a := s.cfg.Pool.AuthByUID(uid)
+	if a == nil || a.AccessToken == "" {
+		return false, true
+	}
+	if a.NeedsRefresh(0) {
+		if s.cfg.LowCreditAccel <= 0 || st.Credits >= s.cfg.LowCreditAccel || a.RefreshToken == "" {
+			return false, true // 非低余额号：维持现状静默跳过
+		}
+		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
+			log.Printf("credit refresh %s refresh token: %v", logfmt.UID8(uid), err)
+			var ue *upstream.Error
+			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+				if s.cfg.Pool.NoteSessionDead(uid) {
+					log.Printf("WARN: credit refresh %s: 连续 %d 次 12153 session dead — 禁用", logfmt.UID8(uid), pool.SessionDeadThreshold())
+				}
+			}
+			// 刷新只是"提前补票"：token 仍有效则继续探测；真正过期才判失败。
+			if a.NeedsRefresh(0) {
+				return false, false
+			}
+		} else {
+			s.cfg.Pool.ClearSessionDead(uid) // 刷新成功清误判计数（与 keepalive 同口径）
+			a.BackfillRealm()                // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
+			if err := a.SaveAtomic(); err != nil {
+				log.Printf("credit refresh %s save: %v", logfmt.UID8(uid), err)
+			}
+		}
+	}
+	// global 与 CN 的余额口径由 billingMeterPaths/UserResourceDetailed 内部按 realm
+	// 分流（global → /billing/meter/*，CN → /v2/...；解析回退 CapacityRemain 覆盖
+	// global 的 Free Plan 套餐），调用方无需区分——global 账号同样纳入定期刷新。
+	remain, buckets, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
+	if err != nil {
+		log.Printf("credit refresh %s: %v", logfmt.UID8(uid), err)
+		return false, false
+	}
+	// 恢复判定：只对「余额耗尽」硬冷却做定向解冻，不碰软冷却/6004 模型级冷却——
+	// 余额探测是只读观测、不是账号恢复的证据；全量解冻会让每 10 分钟一次的刷新
+	// 把限流冷却抹掉，反复重打已限流的号（6004 冷却形同虚设）。
+	s.cfg.Pool.ReviveIfCreditExhausted(uid, remain)
+	s.cfg.Pool.SetCreditsDetailed(uid, remain, buckets.Expiring)
+	// 积分快照：非签到的普通余额探测，供日报回填基线。
+	s.recordHistory(history.Probe, uid, remain)
+	return true, false
 }
 
 // RunActivityNow 立即对池内所有可用账号执行对话活跃上报。

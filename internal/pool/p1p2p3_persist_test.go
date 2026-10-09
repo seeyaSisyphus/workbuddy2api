@@ -173,11 +173,11 @@ func TestCreditsExpiringPersistRoundTrip(t *testing.T) {
 	// 选号第四因子用恢复的值：weightOf 应含 expiring 项。
 	p2.mu.RLock()
 	e := p2.byUID["u1"]
-	wWith := p2.weightOf(e, 1000, time.Now())
+	wWith := p2.weightOf(e, 1000, 500, time.Now())
 	// 对比：把 creditsExpiring 清零后权重应更小（快过期加成消失）。
 	saved := e.creditsExpiring
 	e.creditsExpiring = 0
-	wWithout := p2.weightOf(e, 1000, time.Now())
+	wWithout := p2.weightOf(e, 1000, 500, time.Now())
 	e.creditsExpiring = saved
 	p2.mu.RUnlock()
 	if wWith <= wWithout {

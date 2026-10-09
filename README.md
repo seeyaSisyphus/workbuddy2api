@@ -64,6 +64,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
 ### 请求链路
 
 - **流式 + 非流式** — 出站强制 `stream:true`；SSE 帧按 OpenAI 规范白名单重建；非流式由本地聚合为单响应
+- **模型名解析** — 入站模型名两层解析（`internal/server/resolve_model.go`）：`[realm:]` 前缀（含同义 `g:`）+ 便利别名（如 `deepseek-flash` → `deepseek-v4.1-flash`）；解析结果全链路唯一口径（选号 / 粘性可用集合 / 11102·6004 冷却键 / 成本账本 / 出站请求体）
 - **DeepSeek 思维链注入** — 出站请求体注入 `thinking.type=enabled` + 默认档位，`reasoning_content` 多轮回填，`reasoning_effort` 按模型档位自动降级
 - **系统提示词体系** — 默认透传客户端原始 system（`passthrough` 模式，缺省），仅自定义配置 `custom` 时网关用自有提示词替换客户端 system/developer（从源头消除模板句误报）；`passthrough` 模式遇拦截自动降级中性提示词重试
 - **会话头族注入** — 出站携带官方客户端会话头族（`X-Conversation-Request-ID` 聚合主键 · `X-Conversation-ID` 透传 · B3 链路），轮转 / 重试 / 路径回退复用同键，后台按对话轮聚合不再碎片化（issue #35）
@@ -83,7 +84,11 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
 ### 双域适配
 
 - 同时适配**国内版（CN，`copilot.tencent.com` / `www.codebuddy.cn`）与国际版（Global，`www.workbuddy.ai`）**账号
-- 共享同一账号池，由账号 `realm` 或请求模型名前缀（`cn:` / `global:`）决定路由；`global.enabled` 可一键锁死纯 CN 部署
+- 共享同一账号池，由账号 `realm` 或请求模型名前缀（`cn:` / `global:` / 同义 `g:`）决定路由；`global.enabled` 可一键锁死纯 CN 部署
+- **前缀同义** — `g:` 是 `global:` 的通用同义前缀（`g:glm-5.3` ≡ `global:glm-5.3`），适用于任何 global 模型；`cn:` / `global:` 保持原义，未知前缀（`deepseek:v3` 这类）整串原样当裸名处理，归 CN
+- **大小写不敏感** — 前缀与模型名两层都折叠：`G:glm-5.3` / `GLOBAL:gpt-5.4` / `GLM-5.3` / `DeepSeek-Flash` 均等价于对应的小写规范拼写（上游对模型名严格大小写敏感，大写拼写不折叠必然 11102）
+- **模型名别名** — 硬编码于 `internal/server/resolve_model.go` 的便利别名（当前 `deepseek-flash` → `deepseek-v4.1-flash`），在**前缀解析之后**生效、与 realm 无关：`g:deepseek-flash` → global 域的 `deepseek-v4.1-flash`，裸名 `deepseek-flash` → CN 域的 `deepseek-v4.1-flash`；别名**不出现在 `/v1/models`**（列表只列上游真实 ID）
+- **别名与响应回显** — 别名与大小写折叠只作用于入站解析；出站请求体、SSE / 聚合响应的 `model` 字段、`/status` 的 `rate_limited_models` 与成本账本一律使用解析后的上游真实 ID（客户端发 `deepseek-flash` 或 `GLM-5.3`，响应/台账里会看到 `deepseek-v4.1-flash` / `glm-5.3`）。日志表格行的 model 列保留客户端原串，便于按客户端拼写排查
 - 国际版支持注册激活、地区完善、一次性 trial 加油包领取（`./trial.sh`）
 
 ### 辅助工具
@@ -198,6 +203,14 @@ curl -s http://localhost:7863/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
+
+# 模型名便利写法（别名只作用于入站解析；响应 model 字段回显上游真实 ID）
+#   g:deepseek-flash     → global 域的 deepseek-v4.1-flash（g: 是 global: 的同义前缀）
+#   deepseek-flash       → CN 域的 deepseek-v4.1-flash
+curl -s http://localhost:7863/v1/chat/completions \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"g:deepseek-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
 
 ## 安全与合规
@@ -269,6 +282,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 - `features.reasoning_alias` — 响应/流附等值 `reasoning` 别名字段，兼容只认 OpenRouter 风格单字段的客户端
 - `schedule.checkin_window` / `schedule.checkin_jitter` — 每日窗口内按日期派生的稳定随机时刻签到，账号间错开
 - `schedule.credit_refresh` — 后台定期刷新全账号余额与快过期额度
+- `pool.low_credit_stop` / `pool.low_credit_accel` / `schedule.credit_refresh_low` — 账号积分保护：余额低于底线不参与正常选号（快过期达标 / 该模型实测免费则豁免，全低时降级），跌破加速阈值触发单号延迟探测，活跃低余额号按加速周期定向刷新
 - `internal/history` — 积分快照 JSONL，供积分日报计算当日消耗
 
 上游原始著作权归原作者所有；本仓库的修改部分 © 2026 seeyaSisyphus。

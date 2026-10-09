@@ -61,9 +61,10 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 // CooldownSoftForModel 429 的**模型级**软冷却入口（issue #31）：把该模型的冷却截止
 // 精确对齐到上游重置墙钟（不做指数堆加、不做 softStreak 计数）。
 //
-//   - resetAt 非零（带解析时间）→ modelCooldowns[model].Until = min(resetAt,
-//     now+softRateMax)，ResetAt 记录上游原始墙钟（台账 ResetAt）。不写 until
-//     （全账号级冷却不受模型级限流污染），切模型即可用（模型豁免）。
+//   - resetAt 非零（上游 body 的权威重置文案）→ modelCooldowns[model].Until =
+//     min(resetAt+resetSkewBuffer, now+softRateResetMax)（见 cappedResetUntilLocked），
+//     ResetAt 记录上游原始墙钟（台账 ResetAt）。不写 until（全账号级冷却不受模型级
+//     限流污染），切模型即可用（模型豁免）。
 //   - resetAt 零值（无时间文案）→ 有界退避：base 起按 softStreak 翻倍、封顶
 //     softRateMax，且**在软冷却中**（until 未到期）时不推进/不延长（兜底探测不再把
 //     冷却越堆越厚）。不记录模型（不豁免）。
@@ -77,12 +78,12 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 	if e, ok := p.byUID[uid]; ok {
 		now := time.Now()
 		if !resetAt.IsZero() {
-			// 有上游重置时间：冷却截止 = min(resetAt, now+softRateMax)，不做指数放大。
+			// 上游权威重置墙钟：精确对齐（+缓冲、24h 兜底封顶），不做指数放大。
 			if e.modelCooldowns == nil {
 				e.modelCooldowns = map[string]modelCooldown{}
 			}
 			e.modelCooldowns[model] = modelCooldown{
-				Until:   p.cappedSoftUntilLocked(now, resetAt),
+				Until:   p.cappedResetUntilLocked(now, resetAt),
 				ResetAt: resetAt,
 				Reason:  reason,
 			}
@@ -189,12 +190,37 @@ func (p *Pool) BlockModelClear(uid, model string) {
 //     until：用户重试/并发兜底探测不得把冷却越堆越厚——这正是旧实现「越重试越冷、
 //     全池被推到 2h 封顶」的元凶（每次探测都 softStreak++ 指数翻倍）。
 func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Time, reason string) {
+	// alignedReset=false：resetAt 由 Retry-After 头推导（可信度低于 body 权威文案），
+	// 仍按 softRateMax 封顶——网页头可能给出离谱值，不该被它锁 24h。
+	p.cooldownSoftRate(uid, base, resetAt, reason, false)
+}
+
+// CooldownSoftRateReset 同 CooldownSoftRate，但 resetAt 必须是**上游 body 解析出的权威
+// 重置墙钟**（upstream.ParseRateReset，账号级 429/限流文案），冷却精确对齐该时刻
+// （+90s 缓冲、24h 兜底封顶，见 cappedResetUntilLocked），不再被 softRateMax 截断。
+//
+// 为什么必须单列一个入口：softRateMax 默认 2h，而上游重置点常在 10~12h 后——按 2h 截断
+// 等于提前 8~10 小时把号放出去重撞限流（2026-09-30 实测每 2 小时一轮，累计约 30 次无谓
+// 上游调用）。调用方传入 Retry-After 推导的时刻时**必须**用 CooldownSoftRate，
+// 否则一个网页头就能把号锁 24h。
+func (p *Pool) CooldownSoftRateReset(uid string, base time.Duration, resetAt time.Time, reason string) {
+	p.cooldownSoftRate(uid, base, resetAt, reason, true)
+}
+
+// cooldownSoftRate 两条账号级软冷却入口的共用实现。alignedReset 为真时 resetAt 按
+// 权威重置墙钟对齐（cappedResetUntilLocked），为假时按 softRateMax 截断
+// （cappedSoftUntilLocked）。调用方必须不持锁。
+func (p *Pool) cooldownSoftRate(uid string, base time.Duration, resetAt time.Time, reason string, alignedReset bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		now := time.Now()
 		if !resetAt.IsZero() {
-			e.until = p.cappedSoftUntilLocked(now, resetAt)
+			if alignedReset {
+				e.until = p.cappedResetUntilLocked(now, resetAt)
+			} else {
+				e.until = p.cappedSoftUntilLocked(now, resetAt)
+			}
 		} else if e.coolKind != CoolSoft || !now.Before(e.until) {
 			// 新限流（不在有效软冷却中）：推进有界退避；兜底探测（仍在软冷却中）不翻倍。
 			d := p.softDurationLocked(base, e.softStreak+1)
@@ -208,8 +234,11 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 	}
 }
 
-// cappedSoftUntilLocked 把上游重置墙钟截断到 softRateMax（now+softRateMax 与 resetAt
-// 取较早者）。resetAt 已过期（时钟偏移/文案过期）时日长短钳到时间零点附近，立即恢复。
+// cappedSoftUntilLocked 把**推导出来的**重置时刻截断到 softRateMax（now+softRateMax 与
+// resetAt 取较早者）。resetAt 已过期（时钟偏移/文案过期）时日长短钳到时间零点附近，立即恢复。
+//
+// 与 cappedResetUntilLocked 的分野（调用方别用错）：本函数用于 Retry-After 头推导的时刻
+// 与纯指数退避——网页头可信度低，且 WAF 是 IP 级、随时可能恢复，不该被它锁 24h。
 // 调用方必须已持有 p.mu。
 func (p *Pool) cappedSoftUntilLocked(now, resetAt time.Time) time.Time {
 	cap := now.Add(p.softRateMaxOr())
@@ -220,6 +249,39 @@ func (p *Pool) cappedSoftUntilLocked(now, resetAt time.Time) time.Time {
 		return resetAt
 	}
 	return now.Add(time.Millisecond)
+}
+
+// softRateResetMax 上游**明确给出重置墙钟**时的冷却封顶（区别于指数退避的 softRateMax）。
+//
+// 为什么必须与 softRateMax 分开：上游 6004 的重置点常在 10~12 小时后，而 softRateMax
+// 默认 2h——用 2h 截断等于提前 8~10 小时把号放出去，必然再撞一次 6004。2026-09-30 实测：
+// 6 个 global 号被 6004 后，每 2 小时被放出去重撞一轮，循环到上游重置为止，累计约 30 次
+// 无谓的上游调用 + 反复 503/429 风暴。
+//
+// 仍保留封顶而不是无条件信任上游文案：解析异常/时钟漂移时不能把号锁到几天后。
+// 24h 覆盖真实重置窗口（实测最长 ~12h）并留足余量。
+const softRateResetMax = 24 * time.Hour
+
+// resetSkewBuffer 在上游重置墙钟**之后**再等的缓冲。按秒精确对齐时，本机时钟快几秒就会
+// 让第一次重试正好落在上游重置之前，白吃一个 6004（上游按请求逐个落判）。90s 相对
+// 10h 级窗口可忽略，却足以吸收常见时钟偏移与上游的落地延迟。
+const resetSkewBuffer = 90 * time.Second
+
+// cappedResetUntilLocked 把**上游权威重置墙钟**对齐为冷却截止：
+// min(resetAt + resetSkewBuffer, now + softRateResetMax)。resetAt 已过期/不可信时立即恢复。
+//
+// 用于 resetAt 来自上游 body 权威重置文案的路径（upstream.ParseRateReset：6004 与
+// 账号级 429）。这些路径下"提前解冻"没有任何收益——上游已经承诺了恢复时刻，提前重试
+// 必然失败，只会白烧配额并给风控送样本。调用方必须已持有 p.mu。
+func (p *Pool) cappedResetUntilLocked(now, resetAt time.Time) time.Time {
+	if !resetAt.After(now) {
+		return now.Add(time.Millisecond) // 已过期/时钟偏移：立即恢复
+	}
+	until := resetAt.Add(resetSkewBuffer)
+	if cap := now.Add(softRateResetMax); until.After(cap) {
+		return cap
+	}
+	return until
 }
 
 // softRateMaxOr 返回生效的 softRateMax（未注入时按默认 2h），供封顶计算。

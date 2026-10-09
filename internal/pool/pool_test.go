@@ -706,15 +706,16 @@ func TestCooldownSoftBoundedBackoffIfNotCooling(t *testing.T) {
 	}
 }
 
-// TestCooldownSoftRateResetTimeAligns 带权威重置时间的账号级软冷却：写 until 对齐到
-// 上游重置墙钟、绝不 touch softStreak（旧实现每次都 softStreak++），且不走退避。
+// TestCooldownSoftRateResetTimeAligns 带**权威重置墙钟**（body 解析）的账号级软冷却：
+// 写 until 精确对齐到该墙钟（+对齐缓冲）、绝不 touch softStreak（旧实现每次都 softStreak++），
+// 且不走退避。该语义的入口是 CooldownSoftRateReset（区别于 Retry-After 推导路径）。
 func TestCooldownSoftRateResetTimeAligns(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	reset := time.Now().Add(30 * time.Minute) // 远超 600s 基数，对齐将远超退避基数
 	p.SetSoftRateMax(time.Hour)               // reset 在封顶内，不被截断
 
-	p.CooldownSoftRate("u1", 600*time.Second, reset, "429 rate limit")
+	p.CooldownSoftRateReset("u1", 600*time.Second, reset, "429 rate limit")
 	st, _ := p.Status("u1")
 	if !st.Cooling || st.CoolKind != "soft_rate" {
 		t.Fatalf("应为 soft_rate 冷却: %+v", st)
@@ -722,11 +723,37 @@ func TestCooldownSoftRateResetTimeAligns(t *testing.T) {
 	if st.SoftStreak != 0 {
 		t.Errorf("带重置时间的 429 绝不 softStreak 堆加，soft_streak=%d want 0", st.SoftStreak)
 	}
-	if d := st.Until.Sub(reset); d < -time.Second || d > time.Second {
-		t.Errorf("until=%v want ~reset=%v（精确对齐，无退避）", st.Until, reset)
-	}
+	wantUntilAligned(t, "账号级 until", st.Until, reset)
 	if len(st.RateLimitedModels) != 0 {
-		t.Errorf("账号级 CooldownSoftRate 不写模型台账: %+v", st.RateLimitedModels)
+		t.Errorf("账号级 CooldownSoftRateReset 不写模型台账: %+v", st.RateLimitedModels)
+	}
+}
+
+// TestCooldownSoftRateResetIgnoresSoftRateMax 两条账号级路径的分野：
+//   - CooldownSoftRateReset（body 权威重置）→ 精确对齐，**不被 soft_rate_max 截断**；
+//   - CooldownSoftRate（Retry-After 头推导）→ 仍守 soft_rate_max。
+//
+// 为什么必须分开：上游 body 的重置点在 10~12h 后，按 soft_rate_max(2h) 截断等于提前
+// 8~10 小时放号重撞（2026-09-30 实测每 2h 一轮）；而网页头可信度低、可能给出离谱值，
+// 不该被它把号锁 24h。
+func TestCooldownSoftRateResetIgnoresSoftRateMax(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SetSoftRateMax(10 * time.Minute)
+
+	bodyReset := time.Now().Add(10 * time.Hour) // 复刻线上：重置点在 10 小时后
+	p.CooldownSoftRateReset("u1", 600*time.Second, bodyReset, "429 rate limit")
+	st1, _ := p.Status("u1")
+	if rem := st1.Until.Sub(time.Now()); rem < 9*time.Hour {
+		t.Errorf("权威重置被截断成 %v——旧契约下每 2h 放号重撞一次限额", rem)
+	}
+	wantUntilAligned(t, "权威重置 until", st1.Until, bodyReset)
+
+	p.CooldownSoftRate("u2", 600*time.Second, time.Now().Add(10*time.Hour), "429 rate limit (retry-after)")
+	st2, _ := p.Status("u2")
+	if rem := st2.Until.Sub(time.Now()); rem > 10*time.Minute+time.Second {
+		t.Errorf("Retry-After 推导 until 剩余=%v want ≤ soft_rate_max=10m（网页头不得长锁）", rem)
 	}
 }
 
@@ -931,25 +958,28 @@ func TestCooldownSoftForModelParsedUntil(t *testing.T) {
 	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" {
 		t.Fatalf("rate_limited_models=%+v want [glm-5.3] 的模型级台账", st.RateLimitedModels)
 	}
-	if d := st.RateLimitedModels[0].Until.Sub(reset); d < -time.Second || d > time.Second {
-		t.Errorf("model until=%v want ~reset=%v (diff %v)", st.RateLimitedModels[0].Until, reset, d)
-	}
+	wantUntilAligned(t, "model", st.RateLimitedModels[0].Until, reset)
 }
 
-func TestCooldownSoftForModelCappedBySoftRateMax(t *testing.T) {
-	// 解析时间超出 soft_rate_max → 模型级冷却 until 截断到 soft_rate_max（不无限期拉黑）。
+// TestCooldownSoftForModelCappedByResetMax 上游重置**远超 24h** 时封顶到 softRateResetMax：
+// 保留兜底封顶，避免解析异常/时钟漂移把号锁到几天后。旧契约用 soft_rate_max(2h) 兼任
+// "别锁死"职责，代价是把 10~12h 的正常重置也砍掉（每 2h 放号重撞一轮），故改由独立的
+// 24h 承担——soft_rate_max 从此只封指数退避。
+func TestCooldownSoftForModelCappedByResetMax(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.SetSoftRateMax(10 * time.Minute)
-	reset := time.Now().Add(2 * time.Hour) // 远超过封顶 10m
-	before := time.Now()
-	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "429 rate limit")
+	reset := time.Now().Add(48 * time.Hour) // 远超兜底封顶
+	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
 	st, _ := p.Status("u1")
 	if len(st.RateLimitedModels) != 1 {
 		t.Fatalf("rate_limited_models=%+v want 1 行", st.RateLimitedModels)
 	}
-	if d := st.RateLimitedModels[0].Until.Sub(before); d > 10*time.Minute+time.Second {
-		t.Errorf("model until=%v want capped at soft_rate_max=10m", st.RateLimitedModels[0].Until)
+	rem := st.RateLimitedModels[0].Until.Sub(time.Now())
+	if rem <= 0 || rem > softRateResetMax+time.Second {
+		t.Errorf("until 剩余=%v want ∈ (0, %v]（超长重置被封顶）", rem, softRateResetMax)
+	}
+	if d := st.RateLimitedModels[0].ResetAt.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("reset_at=%v want ~%v（台账仍保留上游原始墙钟）", st.RateLimitedModels[0].ResetAt, reset)
 	}
 }
 
@@ -1177,23 +1207,21 @@ func TestRateLimitedModelsInStatus(t *testing.T) {
 	if !st.Until.IsZero() {
 		t.Errorf("Status.Until=%v 应为零值（6004 不写账号级 until）", st.Until)
 	}
-	// row.Until = 该模型的独立冷却截止（≈ reset，35m < soft_rate_max 2h 未截断）。
-	if d := row.Until.Sub(reset); d < -time.Second || d > time.Second {
-		t.Errorf("row.until=%v want ~%v", row.Until, reset)
-	}
-	// ResetAt 是未经 6004 截断的上游重置墙钟（35m < soft_rate_max 2h，因此未被截断）。
+	// row.Until = 该模型的独立冷却截止（精确对齐 reset + resetSkewBuffer）。
+	wantUntilAligned(t, "row", row.Until, reset)
+	// ResetAt 保留上游原始重置墙钟（不截断、不带缓冲）。
 	if d := row.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
 		t.Errorf("reset_at=%v want ~%v", row.ResetAt, reset)
 	}
 }
 
-// TestRateLimitedModelsRetainsUncappedResetAt soft_rate_max 截断了 until，
-// 但台账必须保留上游未截断的原始重置墙钟（issue #36：运维按真实恢复时刻观察）。
-func TestRateLimitedModelsRetainsUncappedResetAt(t *testing.T) {
+// TestRateLimitedModelsAlignsResetIgnoringSoftRateMax soft_rate_max 不再截断权威重置：
+// row.until 精确对齐上游重置墙钟，reset_at 保留原始值（issue #36：运维按真实恢复时刻观察）。
+func TestRateLimitedModelsAlignsResetIgnoringSoftRateMax(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetSoftRateMax(10 * time.Minute)
-	reset := time.Now().Add(2 * time.Hour) // 远超封顶 10m
+	reset := time.Now().Add(2 * time.Hour) // 远超 soft_rate_max：旧契约会截到 10m
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
 
 	st, _ := p.Status("u1")
@@ -1201,32 +1229,37 @@ func TestRateLimitedModelsRetainsUncappedResetAt(t *testing.T) {
 		t.Fatalf("rate_limited_models=%v want 1 行", st.RateLimitedModels)
 	}
 	row := st.RateLimitedModels[0]
-	// row.Until = 该模型的冷却截止（被截断到封顶 ≤ 10m）。
-	if rem := row.Until.Sub(time.Now()); rem <= 0 || rem > 10*time.Minute+time.Second {
-		t.Errorf("row.until 应在 (0, 10m] 区间，实际剩余 %v", rem)
-	}
+	wantUntilAligned(t, "row（不被 soft_rate_max 截断）", row.Until, reset)
 	// 6004 模型级冷却不写账号级 until：st.Until 为零值。
 	if !st.Until.IsZero() {
 		t.Errorf("Status.Until=%v 应为零值（6004 不写账号级 until）", st.Until)
 	}
-	// reset_at 保留原始 2h 墙钟（未被截断）。
+	// reset_at 保留上游原始 2h 墙钟（不截断、不带缓冲）。
 	if d := row.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
 		t.Errorf("reset_at=%v want ~2h 后=%v", row.ResetAt, reset)
 	}
 }
 
 // TestRateLimitedModelsExpired 限额到期后台账从 Status 消失（恢复）。
-// 用近未来 30ms 的重置墙钟：初始显示台账，等墙钟过后台账消失 + 账号退出冷却。
-// （带解析时间 6004 的 until 由 resetAt 决定，故等待几百 ms 即可确定性触达过期边界。）
+//
+// 用白盒把已写入的 Until 拨到过去来触达过期边界：墙钟路径现在带 resetSkewBuffer(90s)，
+// 再靠 sleep 等过期会让用例多跑一分半。Status 的只读遍历本就跳过 Until 已过的条目，
+// 本用例测的正是该过滤（以及账号随之退出冷却）。
 func TestRateLimitedModelsExpired(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	reset := time.Now().Add(30 * time.Millisecond)
-	p.CooldownSoftForModel("u1", time.Hour, reset, "glm-5.3", "6004 model rate limit")
+	p.CooldownSoftForModel("u1", time.Hour, time.Now().Add(time.Hour), "glm-5.3", "6004 model rate limit")
 	if st, _ := p.Status("u1"); len(st.RateLimitedModels) != 1 {
 		t.Fatalf("初始应对该模型限额显示台账: %+v", st.RateLimitedModels)
 	}
-	time.Sleep(80 * time.Millisecond) // 越过重置墙钟（until 已过）
+	past := time.Now().Add(-time.Second)
+	p.mu.Lock()
+	p.byUID["u1"].modelCooldowns["glm-5.3"] = modelCooldown{
+		Until:   past,
+		ResetAt: past,
+		Reason:  "6004 model rate limit",
+	}
+	p.mu.Unlock()
 	st, _ := p.Status("u1")
 	if len(st.RateLimitedModels) != 0 {
 		t.Errorf("到期后台账应消失: %+v", st.RateLimitedModels)
@@ -1631,13 +1664,16 @@ func (p *Pool) entryWeight(uid string) float64 {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	e := p.byUID[uid]
-	var maxCredits int64
+	var maxCredits, maxExpiring int64
 	for _, x := range p.byUID {
 		if x.credits > maxCredits {
 			maxCredits = x.credits
 		}
+		if x.creditsExpiring > maxExpiring {
+			maxExpiring = x.creditsExpiring
+		}
 	}
-	return p.weightOf(e, maxCredits, time.Now())
+	return p.weightOf(e, maxCredits, maxExpiring, time.Now())
 }
 
 func TestWeightHighCreditsDominates(t *testing.T) {

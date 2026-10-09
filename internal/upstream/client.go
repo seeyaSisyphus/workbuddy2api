@@ -180,12 +180,36 @@ var contentBlockedRule = errorRule{kind: ErrContentBlocked, mode: matchLower, pa
 	"illegal api invocation",
 }}
 
-// badParamsRule 请求体解析失败关键词（issue #41 连带）：HTTP 400 + 上游
-// "Unmarshal chat params failed..."（code 11101）。这是"发给上游的 body 有问题"，
-// 与账号健康无关——不罚号，但仍轮转（commit B）。
+// badParamsRule 上游拒绝请求参数关键词（issue #41 连带）：HTTP 400 + 上游
+// "Unmarshal chat params failed..."（code 11101）或 "Invalid request parameters"
+// （code 11133 / extError.code=model_param_invalid，"the request parameters were
+// rejected by the model provider"）。
+//
+// 这是"发给上游的 body 有问题"，与账号健康、网关可用性**都**无关——不罚号。
+//
+// 11133 于 2026-10-01 收录：此前它不被任何规则识别，落 ErrClient 兜底 → 末端映射按
+// 默认值输出 503 + no_healthy_account，把「你的请求参数有问题」（客户端侧、重试无用）
+// 谎报成「网关没有可用账号」（服务器侧、重试可能有效）。客户端据此无意义重试，且每次
+// 重试在网关侧白烧 3 次换号轮换（实测同一请求轮转 3 账号全部 11133，成功率 0%）。
+//
+// 子码通道：11133 的 extError.code 取值多样（model_param_invalid / integer_below_min_value
+// 等，后者见 gpt-5.4 要求 max_tokens≥100 的实测），只认「顶层 code」会漏掉换子码的形态，
+// 故双通道收录。
 var badParamsRule = errorRule{kind: ErrBadParams, mode: matchExact, patterns: []string{
 	"Unmarshal chat params failed",
 	`"code":11101`,
+	`"code":11133`,
+	`model_param_invalid`,
+	`integer_below_min_value`,
+	// 11115「prompt is too long: N tokens > M maximum」：输入（新输入+历史对话）超过模型
+	// 上下文上限。这是**客户端侧**错误（精简内容或新建任务才可能成功，原样重试必然同样
+	// 失败），上游自带中文 displayMsg/displayTips 说明，透传即可让客户端直接展示。
+	// 2026-10-01 收录：此前不被任何规则识别 → 落 ErrClient → 出口按默认值输出
+	// 503 no_healthy_account，把"内容太长"谎报成"网关没有可用账号"，客户端据此无意义重试。
+	// 判定用 msg 短语为主、code 为辅：上游该 code 名下另有语义（见 sanitize.go 注释），
+	// "prompt is too long" 是本类的权威文案。
+	"prompt is too long",
+	`"code":11115`,
 }}
 
 // alreadyCheckinRule "今天已签到"关键词（上游对重复签到返回 code!=0，
@@ -225,8 +249,18 @@ func SoftRateResetLoc() *time.Location { return softRateResetLoc }
 // 而不是账号整体被限流——账号健康，只是这个模型此刻被限（issue #31）。
 const modelRateLimitCode = "6004"
 
-// softRateResetPattern 匹配「将在 … 重置」，捕获中间的时间串。
-const softRateResetPattern = `将在 (.+?) 重置`
+// softRateResetPattern 匹配限流文案里的重置时间，捕获时间串本身。
+// 上游按账号/区域下发中英两版文案（语义相同：重置墙钟 + 建议切换其他模型）：
+//   - 中文：「您的使用量已超出频率限制，将在 2026-09-26 23:44:37 UTC+8 重置，
+//     您也可以切换其他模型继续使用。」
+//   - 英文："usage exceeds frequency limit, but don't worry, your usage will
+//     reset at 2026-09-26 23:44:37 UTC+8, alternatively, you can switch to the
+//     other models to continue using it."
+//
+// 两版共用同一时间戳格式（softRateTimeLayout 的字面量形态），故直接锚定时间戳、
+// 不依赖语言侧的后缀（「重置」/「, alternatively」）——只认中文版会让英文 6004
+// 落账号级退避（全账号锁死、无模型级台账与切模型豁免）。
+const softRateResetPattern = `(?:将在|will reset at)\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})`
 
 // 限流判定正则预编译为包级 var（发现 8）：IsModelRateLimit / ParseRateReset
 // 在每次错误分类、每个限流 body 上调用，函数体内 MustCompile 是纯浪费；
@@ -403,8 +437,9 @@ func parseRetryNumber(v, headerName string) (time.Duration, bool) {
 	}
 }
 
-// ParseRateReset 从任何限流响应 body 里统一解析「将在 … 重置」时间（上游 UTC+8 文案）。
-// 成功返回解析出的**墙钟时刻**（按 UTC+8 解释），失败返回零值 + false。
+// ParseRateReset 从任何限流响应 body 里统一解析重置时间（上游 UTC+8 文案，中英两版
+// 同口径，见 softRateResetPattern）。成功返回解析出的**墙钟时刻**（按 UTC+8 解释），
+// 失败返回零值 + false。
 //
 // 是否走模型级豁免、时日对齐到 until 还是 modelCooldowns，由冷却决策侧（pool）按
 // IsModelRateLimit 判定，本函数只负责「把上游明说的恢复时刻抽出来」。没有时间文案
@@ -414,9 +449,8 @@ func ParseRateReset(body string) (time.Time, bool) {
 	if len(m) < 2 {
 		return time.Time{}, false
 	}
-	ts := strings.TrimSpace(m[1])
-	ts = strings.TrimSuffix(ts, " UTC+8") // 去掉后缀，固定按 softRateResetLoc 解释
-	t, err := time.ParseInLocation(softRateTimeLayout, ts, softRateResetLoc)
+	// 捕获组即时间戳本体（UTC+8 后缀/语言侧措辞都在模式之外），直接按固定时区解释。
+	t, err := time.ParseInLocation(softRateTimeLayout, strings.TrimSpace(m[1]), softRateResetLoc)
 	if err != nil {
 		return time.Time{}, false
 	}
@@ -534,9 +568,9 @@ type Client struct {
 	// IdleTimeout 聊天 SSE 流中空闲超时；<=0 表示禁用空闲监控。
 	IdleTimeout time.Duration
 
-	// effortsMu/efforts 缓存各模型 supportedEfforts（FetchModels 刷新），供请求体 effort 降级。
-	// 键按 realm 分层（map[realm]map[model][]efforts）：CN 探测结果不得被 global 同模型名
-	// 请求复用（同名不同档位会错误降级，C-2）。global 侧暂无 efforts 探测 → 桶缺失即透传。
+	// effortsMu/efforts 缓存各模型显式 supportedEfforts（FetchModels/FetchGlobalModels 刷新），
+	// 供请求体 effort 归一化。键按 realm 分层（map[realm]map[model][]efforts），防止同名
+	// 模型的 CN/global 能力互相污染。
 	effortsMu sync.RWMutex
 	efforts   map[string]map[string][]string
 
@@ -617,6 +651,7 @@ type Client struct {
 // New 生产默认值。配置连接池减少 TLS 握手。
 func New() *Client {
 	tr := &http.Transport{
+		Proxy:               http.ProxyFromEnvironment,
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
 		IdleConnTimeout:     90 * time.Second,
@@ -680,9 +715,8 @@ func (c *Client) chatBase(a *auth.Auth) string {
 func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
 	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
 	if realmKey(realm) == "global" {
-		// global 域降级源 = 远端探测桶（权威）∪ 产品静态兜底表（全局 21 名内档位如
-		// deepseek-v4.1-flash ['high']）。当前探测桶为空时也按静态表降级，不全程透传
-		// （issue #84：往 WorkBuddy 上游发 low/max 非法，须降级到 high）。
+		// global 域以远端显式 supportedEfforts 为权威，静态表只补远端缺失的已知能力。
+		// reasoning.effort 单值不构成白名单，不能据此把合法 max 降为默认 high。
 		efforts, defs = globalEffortMap(efforts, defs)
 	}
 	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints, efforts, defs)
@@ -928,8 +962,8 @@ const (
 	globalChatConsolePath = "/console/chat/completions"
 )
 
-// chatFallbackHTTPStatus global chat fallback 只在 404/405 时发生（R9：上游新旧路径分叉）。
-func chatFallbackHTTPStatus(status int) bool { return status == 404 || status == 405 }
+// chatFallbackHTTPStatus global chat fallback 在 404/405 或 403（WAF 拦截页）时换路径重试。
+func chatFallbackHTTPStatus(status int) bool { return status == 404 || status == 405 || status == 403 }
 
 // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
 // DeptestOnly: 全库仅 upstream 包测试引用；生产全走 ChatStreamContext
@@ -981,7 +1015,10 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		resp, err := c.chatHTTP().Do(req)
 		if err != nil {
 			cancel()
-			log.Printf("ERR: [upstream] chat_stream uid=%s: transport error: %v", logfmt.UID8(a.UID), err)
+			log.Printf("ERR: [upstream] chat_stream uid=%s: transport error on %s: %v", logfmt.UID8(a.UID), path, err)
+			if attempt < len(c.chatPaths(a))-1 {
+				continue
+			}
 			return nil, 0, nil, err
 		}
 		if resp.StatusCode >= 400 {
@@ -997,6 +1034,12 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			kind := Classify(resp.StatusCode, string(raw))
 			log.Printf("WARN: [upstream] chat_stream uid=%s: upstream %d %s body=%s",
 				logfmt.UID8(a.UID), resp.StatusCode, kind, truncate(string(raw), 200))
+			// 参数类拒绝（11101/11133）落盘出站 body：上游 extError.param 实测为空串，
+			// 不给出是哪个参数被拒；该错误间歇发生且相邻请求正常，没有出站原文就无法定位。
+			// 只在此路径写盘（日均个位数），失败只记日志不影响链路。
+			if kind == ErrBadParams {
+				dumpBadParams(prepared, raw, a.UID, path, resp.StatusCode)
+			}
 			// global 首次路径 404/405 → 换 fallback 路径重试；其余状态码直接返回。
 			if attempt < len(c.chatPaths(a))-1 && chatFallbackHTTPStatus(resp.StatusCode) {
 				continue
@@ -1393,7 +1436,7 @@ func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
 }
 
 // CreditBuckets 按到期紧迫度拆分的积分余额（供 pool 优先消耗快过期积分）。
-// 背景（issue:积分过期）：套餐/奖励积分按 PackageEndTime 分批过期，总量口径的
+// 背景（issue:积分过期）：套餐/奖励积分按批到期（上游 DeductionEndTime），总量口径的
 // remain 会让"明天就作废"的积分与"30 天后才过期"的积分被无差别选号，
 // 导致快过期积分没优先用掉、白白作废。拆桶后选号可优先消耗 Expiring。
 type CreditBuckets struct {
@@ -1406,12 +1449,14 @@ type CreditBuckets struct {
 // Total 返回两桶合计可用积分（= UserResource 的 remain 口径）。
 func (b CreditBuckets) Total() int64 { return b.Expiring + b.Stable }
 
-// packageEndLayout 上游 PackageEndTime 的时间格式（与请求体过滤串同口径）。
+// packageEndLayout 请求体过滤串的时间格式（"2006-01-02 15:04:05"，UTC+8 墙钟）。
+// 注意：这是**请求**字段 PackageEndTimeRange* 的格式；上游实际按响应的
+// DeductionEndTime（毫秒 epoch）过滤，响应里并没有 PackageEndTime 字段。
 const packageEndLayout = "2006-01-02 15:04:05"
 
 // UserResourceDetailed 同 UserResource，但按到期时间把余额拆成 CreditBuckets。
 // soon>0 时把到期时间 <= now+soon 的套餐余额计入 Expiring；soon<=0 时全部归 Stable。
-// PackageEndTime 解析失败/缺失的套餐保守归入 Stable（不误标为快过期而插队）。
+// 到期时间缺失/非正的套餐保守归入 Stable（不误标为快过期而插队）。
 // 单套餐取数口径（Cycle* 优先）与 UserResource 完全一致，保证向后兼容。
 func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain int64, buckets CreditBuckets, err error) {
 	now := time.Now()
@@ -1431,14 +1476,15 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain 
 		Response struct {
 			Data struct {
 				Accounts []struct {
-					PackageName         string `json:"PackageName"`
-					PackageEndTime      string `json:"PackageEndTime"` // "2006-01-02 15:04:05"，缺省/空 = 无到期
-					CapacitySize        int64  `json:"CapacitySize"`
-					CapacityRemain      int64  `json:"CapacityRemain"`
-					CapacityUsed        int64  `json:"CapacityUsed"`
-					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
-					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
-					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
+					// DeductionEndTime 套餐可用截止时刻（毫秒 epoch）。上游响应的
+					// 到期字段就是它：请求体里的 PackageEndTimeRange* 实际也按它过滤，
+					// 响应中并不存在 PackageEndTime。毫秒 epoch 无时区歧义（对比
+					// CycleEndTime 是 UTC+8 墙钟串），直接用 time.UnixMilli 还原。
+					DeductionEndTime    int64 `json:"DeductionEndTime"`
+					CycleCapacitySize   int64 `json:"CycleCapacitySize"`
+					CycleCapacityRemain int64 `json:"CycleCapacityRemain"`
+					CycleCapacityUsed   int64 `json:"CycleCapacityUsed"`
+					CapacityRemain      int64 `json:"CapacityRemain"`
 				} `json:"Accounts"`
 			} `json:"Data"`
 		} `json:"Response"`
@@ -1460,14 +1506,11 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain 
 			r = 0
 		}
 		remain += r
-		// 分桶：仅 soon>0 且能解析出有效到期时间、且确实在窗口内 → Expiring。
-		if soon > 0 && r > 0 && acct.PackageEndTime != "" {
-			// 上游时间为 UTC+8 墙钟（与 softRateResetLoc 同口径，官网展示时区）。
-			if end, perr := time.ParseInLocation(packageEndLayout, acct.PackageEndTime, softRateResetLoc); perr == nil {
-				if !end.After(now.Add(soon)) {
-					buckets.Expiring += r
-					continue
-				}
+		// 分桶：仅 soon>0 且到期时间有效、且确实在窗口内 → Expiring。
+		if soon > 0 && r > 0 && acct.DeductionEndTime > 0 {
+			if !time.UnixMilli(acct.DeductionEndTime).After(now.Add(soon)) {
+				buckets.Expiring += r
+				continue
 			}
 		}
 		buckets.Stable += r
