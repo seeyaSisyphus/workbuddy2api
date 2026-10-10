@@ -10,8 +10,11 @@
 package session
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -65,13 +68,21 @@ func New(cfg Config) *Router {
 }
 
 // StartGC 启动后台 GC goroutine（幂等）。进程退出时调 StopGC。
+//
+// stop channel 必须在启 goroutine 前捕获到**局部变量**：goroutine 在 select 里
+// 每轮重新求值 r.stop 是无锁读，而 StopGC 持写锁把它置 nil——既是数据竞争
+// （-race 可复现），又会在读到 nil 后让该 case 永久阻塞（nil channel 永不就绪），
+// 于是关停彻底失效：goroutine 再也不会退出，ticker 无限触发 gcOnce（goroutine
+// 泄漏 + 关停后仍持续 GC）。捕获局部变量后，close(stop) 与 select 观测的是同一个
+// channel，StopGC 一定能让 goroutine 退出。
 func (r *Router) StartGC() {
 	r.mu.Lock()
 	if r.stop != nil {
 		r.mu.Unlock()
 		return
 	}
-	r.stop = make(chan struct{})
+	stop := make(chan struct{})
+	r.stop = stop
 	r.mu.Unlock()
 
 	go func() {
@@ -79,7 +90,7 @@ func (r *Router) StartGC() {
 		defer t.Stop()
 		for {
 			select {
-			case <-r.stop:
+			case <-stop:
 				return
 			case <-t.C:
 				r.gcOnce(time.Now())
@@ -307,11 +318,19 @@ func hashIndex(key string, n int) int {
 //  2. metadata.conversationId
 //  3. conversation_id
 //  4. conversationId
-//  5. metadata.user_id
+//  5. prompt_cache_key
 //
 // issue #35：客户端实际发 camelCase 的 conversationId，此前只识别 snake_case，
 // 导致粘性路由不命中、同对话轮转不同账号、上游上下文缓存 miss。现两种命名均识别，
 // snake_case 优先级高于 camelCase（同值不同名命中同一对话时返回相同值，天然不混用）。
+//
+// user_id 已剔除（上游 ebd7921）：user 维度粒度过粗——一个 user 的全部并行对话会被
+// 钉到同一账号，远粗于上游对话级缓存边界（P1-anti-monopoly 契约）。只发 user_id 的
+// 客户端按契约回落加权轮换（粘性由 StickyFallbackKey 的抑制闸保证不借首条 prompt 复活）。
+//
+// prompt_cache_key 纳入（上游 8058019）：OpenAI 系的会话级前缀缓存键，语义就是
+// 「同一会话复用同一前缀」，与粘性诉求同源。部分客户端（pi-ai 驱动的 dsh 等）把
+// 会话 ID 放在这里而非 conversation_id。放最后，不抢占 conversation 维度的优先级。
 func ExtractKey(body []byte) string {
 	if len(body) == 0 {
 		return ""
@@ -327,14 +346,100 @@ func ExtractKey(body []byte) string {
 		if v := strOrEmpty(meta["conversationId"]); v != "" {
 			return v
 		}
-		if v := strOrEmpty(meta["user_id"]); v != "" {
-			return v
-		}
 	}
 	if v := strOrEmpty(obj["conversation_id"]); v != "" {
 		return v
 	}
-	return strOrEmpty(obj["conversationId"])
+	if v := strOrEmpty(obj["conversationId"]); v != "" {
+		return v
+	}
+	if v := strOrEmpty(obj["prompt_cache_key"]); v != "" {
+		return v
+	}
+	return ""
+}
+
+// StickyFallbackKey 为**无会话标识**的客户端派生会话级稳定粘性键（上游 8058019）。
+//
+// 为什么需要：OpenAI 兼容协议本身没有会话 ID 字段。dsh / Codex / Cherry Studio 等
+// 客户端的请求体里既无 conversationId 也无 metadata，ExtractKey 恒返回空串 →
+// 粘性路由永不参与 → 同一段连续请求在账号池里逐请求轮换换号（上游前缀缓存也被打散，
+// 费用上升）。本函数给这类客户端一个不依赖其配合的会话级键：
+// body 里**首条** role=="user" 消息文本的 sha256 前 16 字节。
+//
+// 为什么取首条：会话内历史不断追加，但首条 user 消息在整段会话中恒定 → 同会话恒同键；
+// 用户开新会话（首条消息不同）→ 自然换键。
+//
+// 与 TurnKey 的区别（勿混用）：TurnKey 取**最后一条** user 消息，是**轮级**键，供上游
+// 会话头族按"对话轮"聚合；本函数取**首条**，是**会话级**键，供粘性绑定长期复用。
+//
+// 抑制条件（上游 10eefa8，P1-anti-monopoly 契约在 fallback 路径的延伸）：body 携带
+// metadata.user_id 或顶层 user_id 时**恒返回 ""**。ExtractKey 有意剔除 user_id
+// 作粘性键，这类客户端按契约回落加权轮换。若 fallback 不设此闸，只发 user_id 的
+// 请求会借首条 prompt 重新获得粘性，使该契约在 handler 侧失效。
+//
+// 无 body / 无 messages / 无 user 消息 / 该消息无文本 → ""（调用方回落无粘性，
+// 保持旧行为；不伪造会话）。
+func StickyFallbackKey(body []byte) string {
+	if hasUserID(body) {
+		return ""
+	}
+	text := firstUserText(body)
+	if text == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(text))
+	return "fb:" + hex.EncodeToString(sum[:16])
+}
+
+// hasUserID 报告 body 是否携带 user 维度标识（metadata.user_id 或顶层 user_id）。
+// 只判「字段存在且为非空字符串」，与 ExtractKey 的 strOrEmpty 口径一致。
+// 解析失败按「无 user_id」处理（不因坏 body 抑制 fallback——坏 body 本就在
+// firstUserText 里返回 ""，两条路径都收敛到无粘性）。
+func hasUserID(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return false
+	}
+	if meta, ok := obj["metadata"].(map[string]any); ok {
+		if strOrEmpty(meta["user_id"]) != "" {
+			return true
+		}
+	}
+	return strOrEmpty(obj["user_id"]) != ""
+}
+
+// firstUserText 取 body 里**首条** role=="user" 消息的内容签名（去首尾空白）；
+// 无则 ""。签名走 ids.go contentSignature：纯文本与旧 contentText 结果一致
+// （存量粘性键零漂移），纯图片轮可签名（首图会话的粘性盲区修复，上游 a767465）。
+func firstUserText(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var obj struct {
+		Messages []struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return ""
+	}
+	for i := range obj.Messages {
+		if obj.Messages[i].Role != "user" {
+			continue
+		}
+		if text := strings.TrimSpace(contentSignature(obj.Messages[i].Content)); text != "" {
+			return text
+		}
+		// 首条 user 消息无可签名内容（空/null 等）→ 不继续往后找：往后找会让
+		// 键随会话推进而漂移（一旦某轮该位置带上文本），破坏"同会话恒同键"。
+		return ""
+	}
+	return ""
 }
 
 // strOrEmpty 把 JSON 字符串字段安全转 string（非字符串类型返回空）。

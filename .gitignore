@@ -39,6 +39,15 @@ config.json.bak-*
 # Backups (contains auth tokens)
 backups/
 
+# 本机联调产物（含账号标识/上游原文，勿入历史；评审补充）
+/.creditprobe.json
+/.tmp_or*.json
+/*.sse
+/wb2api.exe.bak-*
+/start.bat.bak-*
+/start-silent.vbs.bak-*
+*.bak-*
+
 # IDE
 .idea/
 .vscode/

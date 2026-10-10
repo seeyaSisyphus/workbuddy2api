@@ -85,6 +85,13 @@ func main() {
 	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比本地新才采用，否则本地优先
 	p.SyncToDir(auths)      // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
 
+	// auths 目录热加载（上游 c2c0201）：新增凭证文件自动进池，免去「加完账号手动重启网关」。
+	// 启动时的 SyncToDir 已建立基线，监听只在后续目录内容变化时触发（见 pool/watch.go）。
+	// 注意：SyncToDir 会剔除列表外账号——凭证文件写入须走原子替换（login.sh 的
+	// tempfile + os.replace 形态），半写入的坏文件会被 LoadDir 跳过并导致该账号短暂出池。
+	stopWatch := p.StartAuthDirWatch(cfg.AuthDir)
+	defer stopWatch()
+
 	// 熔断器 + 在途上限 + 三因子加权调优（从 config 注入，非正值回退默认）。
 	p.SetBreaker(cfg.Pool.BreakerThreshold, cfg.BreakerCooldownDur, cfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(cfg.Pool.MaxInFlight)

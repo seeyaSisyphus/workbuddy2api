@@ -48,6 +48,19 @@
   小程序成长任务（growth 域 X-Client-Platform: miniprogram 专属下发，chat 域同头）：
     Sequential_Tasks_1  在小程序内完成 1 次有效对话（mini chat_request_send，
                         无 activityId——服务端按 source=mini_program 指纹关联） 100c+5e
+    school_season      参与「校园日」有奖活动（jump 落 coffee-activity H5 = school 开学季
+                        同一活动；mini chat_request_send + activityId 点亮）    100c+5e
+    Sequential_Tasks_2 在小程序内选中专家并完成有效对话（mp 指纹 expert_actual_use，
+                        不带 activityId/conversationId——小程序源码实测形状）   200c+5e
+    Sequential_Tasks_3 在小程序内完成 5 次有效对话（判据与 1 同形状，逐次上报、
+                        进度按上报条数累加，实测一次上报 5 条即 5/5）          300c+5e
+    Sequential_Tasks_4 在小程序内创建 1 个定时任务（mp 指纹
+                        automated_task_create_suc：wx_app_cloud + mode=CLOUD，
+                        无 rrule 对象——小程序事件形状与桌面 automation_1 不同源）100c+5e
+    Sequential_Tasks_5 在小程序内选择 GLM5.2 模型并完成有效对话（mp 指纹
+                        chat_request_send + requestModelId=glm-5.2——比 Tasks_1 多
+                        模型上下文这一条判据；营地上线 2026-09-25 00:00 CST 前
+                        locked，accept 被服务端拒绝）                          100c+5e
   仍不可伪造：
     Expert_Philanthropy   真实捐款动作(M8)
 
@@ -118,6 +131,25 @@ MAPPING = {
     "desktop_chat_1_time":    {"kind": "school", "target": 1, "src": "无(桌面 6 连+activityId)"},
     # 小程序成长任务（growth 域小程序限定）：列表/accept/claim 均需 X-Client-Platform: miniprogram
     "Sequential_Tasks_1":     {"kind": "minichat", "target": 1, "src": "无(mini 对话无activityId)"},
+    # 同下发口径的「校园日」任务：判据是 school 域 activityId 关联（mini chat + activityId）
+    "school_season":          {"kind": "schoolseason", "target": 1, "src": "无(mini chat+activityId)"},
+    # 小程序成长任务续（同 mp 下发口径、同 minichat 处理链路）：
+    # Sequential_Tasks_2 = 小程序内选中专家并完成有效对话，判据 mp 指纹 expert_actual_use，
+    # 无 activityId/conversationId（小程序源码实测形状，勿照抄 school 的 expert 事件）
+    "Sequential_Tasks_2":     {"kind": "miniexpert", "target": 1, "src": "专家市场 ex_ id(mini)"},
+    # Sequential_Tasks_3 = 小程序内完成 5 次有效对话：与 Tasks_1 判据同形状（mp 指纹
+    # chat_request_send 无 activityId），只是 target=5 —— 按上报条数累加，无需新事件形状
+    "Sequential_Tasks_3":     {"kind": "minichat", "target": 5, "src": "无(mini 对话×5 无activityId)"},
+    # Sequential_Tasks_4 = 小程序内创建一个定时任务：判据 mp 指纹 automated_task_create_suc
+    # （小程序源码实测形状：ideName=wx_app_cloud + mode=CLOUD，**不带** schedule/rrule 对象
+    #  ——桌面 automation_1 的 rrule 虚拟对象是另一域口径，照抄会失去 mp 关联）
+    "Sequential_Tasks_4":     {"kind": "miniautomation", "target": 1, "src": "无(mp 自造定时任务名)"},
+    # Sequential_Tasks_5 = 小程序内选择 GLM5.2 模型并完成有效对话：判据同 minichat 的
+    # mini 指纹 chat_request_send，只是**多带模型上下文**（requestModelId=glm-5.2 /
+    # requestModelName=GLM-5.2）——服务端据此把这次对话计入「用过 GLM5.2」。
+    # 注意本任务营地上线时间为 2026-09-25 00:00 CST，解锁前 accept 被服务端拒绝
+    # （task locked until 2026-09-25），届时才可实测。
+    "Sequential_Tasks_5":     {"kind": "miniglmchat", "target": 1, "src": "无(glm-5.2 模型上下文)"},
     # 不可伪造（真实业务副作用）
     "Expert_Philanthropy":    {"unforgeable": True, "reason": "真实捐款动作(M8)"},
 }
@@ -467,7 +499,11 @@ def ids_for(kind, auth, need, offset=0):
         return [("", {}) for _ in range(need)]
     if kind == "richmeow":
         return [("", {}) for _ in range(need)]
-    if kind in ("buddy5", "library", "buddyfirst", "minichat"):
+    if kind == "miniexpert":
+        # 专家 id 取自小程序自身的专家市场端点（mp 口径，与 school 段的 school 分类不同源）
+        return _dedup_slice(_fetch_market_experts(auth), offset, need)
+    if kind in ("buddy5", "library", "buddyfirst", "minichat", "schoolseason",
+                "miniautomation", "miniglmchat"):
         # history/current 不是顺序语义：buddy5/library/buddyfirst 是固定事件组按需补 1 次（offset 无意义）
         return [("", {}) for _ in range(need)]
     if kind == "school":
@@ -613,6 +649,41 @@ def report_web_event(auth, event_code, page_url, element_id, element_name):
     return st, sc
 
 
+def mp_device_fingerprint(auth):
+    """小程序「公共遥测字段」——小程序源码 module 22015 的真实形状（wQ 基座）：
+
+        {ideType:"WorkBuddy_MP", ideVersion:"2.2.8", extName:"workbuddy-mp",
+         extVersion:"2.2.8", product:"SaaS", os, osVersion, arch,
+         machineId, timezone}
+
+    ideVersion/extVersion/product 取自源码常量模块 25439（o.i8 / c5），**恒定值**——
+    2.2.8 是小程序包版本而非 SaaS 状态，故与 school 段那份 extVersion="SaaS" 的
+    手抄形状不同源（school 段是早前凭观察拼的，此处以源码为准则）。
+    os/osVersion/arch 是 getDeviceInfo() 的运行时值，这里固定成一份真实安卓机指纹
+    （android 14 / arm64，与 miniexpert 分支同口径）；machineId 由 uid 稳定派生。
+    """
+    return {
+        "ideType": "WorkBuddy_MP", "ideVersion": "2.2.8",
+        "extName": "workbuddy-mp", "extVersion": "2.2.8", "product": "SaaS",
+        "os": "android", "osVersion": "14", "arch": "arm64",
+        "timezone": "Asia/Shanghai",
+        "machineId": derive_id(auth, "machine"),
+    }
+
+
+def report_mp_event(auth, ev):
+    """按小程序域上报单事件：{chat}/v2/report，body=[event]（school.report_events 通道）。
+
+    与桌面/web 通道并列的第三条上报路径。**不**注入 X-Client-Platform：mp 身份由
+    body 里的指纹表达（ideName=wx_app_cloud + ideType=WorkBuddy_MP + source=mini_program），
+    Tasks_1/2/3/4 与 school_season 均由该通道点亮实证；只有 list/accept/claim 三个
+    任务端点必须带 X-Client-Platform: miniprogram。返回 (st, code)。
+    """
+    st, r = school.report_events(auth, [ev])
+    sc = r.get("code") if isinstance(r, dict) else r
+    return st, sc
+
+
 # --------------------------------------------------------------------------
 # 事件构建器（照抄各 task_*.py 已验证形状，必带 userId）
 # --------------------------------------------------------------------------
@@ -736,6 +807,84 @@ def build_event(auth, kind, obj_id, meta, idx):
                 "extVersion": "2.4.0", "mode": "chat",
                 "conversationId": cid, "requestId": cid, "inputLength": 12,
                 "mentionContexts": [], "mentionContextCount": 0, "userId": uid}
+
+    if kind == "miniexpert":
+        # 小程序成长任务 Sequential_Tasks_2（选中专家并完成有效对话）判据：
+        # mp 指纹 expert_actual_use。形状对齐小程序源码 app-service.js 的真实发射点
+        # （common.mp 遥测 y() + ideName=wx_app_cloud + 专家字段），机读差异字段：
+        #   · 无 conversationId/activityId —— 真实事件就是这两个字段都不带
+        #     （不同于 school 域 expert 事件：那套带 activityId+SaaS 才是开学季判据）
+        #   · extVersion 用小程序自身版本 2.2.8（school 段的 "SaaS" 是另一口径）
+        #   · type 固定 "send_message"（小程序恒发此值）
+        # 实测 00e26541：上报即 completed，claim 入账 200c+5e（两域无差异）。
+        return {"eventCode": "expert_actual_use", "timestamp": now, "reportDelay": 0,
+                "ideName": "wx_app_cloud", "ideType": "WorkBuddy_MP",
+                "extName": "workbuddy-mp", "extVersion": "2.2.8", "product": "SaaS",
+                "source": "mini_program", "os": "android", "osVersion": "14",
+                "arch": "arm64", "timezone": "Asia/Shanghai",
+                "machineId": derive_id(auth, "machine"),
+                "userId": uid, "id": obj_id, "name": obj_id,
+                "expertTitle": m.get("name") or obj_id, "type": "send_message",
+                "characterCount": 12, "expertType": m.get("expertType") or "agent"}
+
+    if kind == "miniautomation":
+        # 小程序成长任务 Sequential_Tasks_4（在小程序内创建定时任务）判据：
+        # mp 指纹 automated_task_create_suc。形状取自小程序源码真实发射点
+        # （dynamic-common/appservice.app.js TaskFormSheet 创建成功后
+        #   x() → z({...wQ("automated_task_create_suc"), ...Ao(),
+        #           ideName:"wx_app_cloud", mode:"CLOUD", name, source:"manually",
+        #           skills, skillCount, scheduleType})）：
+        #   · 与桌面 automation_1 同 eventCode，但**不带** schedule/rrule 对象、
+        #     不带 modelId/connector/pushTo* 等桌面字段——小程序事件根本没有这些键，
+        #     多带无用且偏离真实形状（勿照抄 automation_1 的 build_event 分支）
+        #   · scheduleType 取小程序表单频率枚举：daily/interval/once（源码
+        #     h() 归一化函数），单次任务用 daily
+        # 实测 00e26541：上报即 completed，claim 入账 100c+5e。
+        return {"eventCode": "automated_task_create_suc", "timestamp": now,
+                "reportDelay": 0, "ideName": "wx_app_cloud",
+                "ideType": "WorkBuddy_MP", "ideVersion": "2.2.8",
+                "extName": "workbuddy-mp", "extVersion": "2.2.8", "product": "SaaS",
+                "source": "mini_program", "mode": "CLOUD",
+                "os": "android", "osVersion": "14", "arch": "arm64",
+                "timezone": "Asia/Shanghai",
+                "machineId": derive_id(auth, "machine"),
+                "userId": uid, "userNickname": auth.get("nick", ""),
+                "name": "每日读书提醒", "skills": "", "skillCount": 0,
+                "scheduleType": "daily"}
+
+    if kind == "miniglmchat":
+        # 小程序成长任务 Sequential_Tasks_5（在小程序内选择 GLM5.2 模型并完成有效对话）
+        # 判据：mp 指纹 chat_request_send **+ 模型上下文**。
+        # 形状取自小程序源码 growth 事件模块（app-service.js 模块 86692 导出 d/v）：
+        #   {...wQ("chat_request_send"), ...Ao(), ideName: e.ideName,
+        #    source: "mini_program", [mode], conversationId, requestId, inputLength,
+        #    requestModelId: e.requestModelId, requestModelName: e.requestModelName,
+        #    mentionContexts, mentionContextCount, command: "", traceId, [ext1], [activityId]}
+        # 其中 wQ/Ao 即 module 22015 公共基座（mp_device_fingerprint + userId/userNickname）。
+        #   · ideName 用 wx_app_cloud（模块 25439 常量 pD = 云端小程序形态；同文件里
+        #     wx_app_local 是本地 native 通道那一支）。school/miniexpert 已实证
+        #     wx_app_cloud 可入账，故沿用。
+        #   · conversationId/requestId **必带且必须相等**（源码同值传递；Tasks_1 实测
+        #     形状即 cid==cid）。模型上下文是本任务与 Tasks_1 的唯一新增判据。
+        #   · requestModelId/Name 用 `glm-5.2` / `GLM-5.2`（与 /v3/config 目录、
+        #     桌面 Model_chat_GLM5.2 分支同一对取值）。
+        ev = {"eventCode": "chat_request_send", "timestamp": now, "reportDelay": 0,
+              "ideName": "wx_app_cloud", "mode": "chat",
+              "source": "mini_program",
+              "conversationId": cid, "requestId": cid, "inputLength": 12,
+              "requestModelId": "glm-5.2", "requestModelName": "GLM-5.2",
+              "mentionContexts": [], "mentionContextCount": 0,
+              "command": "", "traceId": cid,
+              "userId": uid}
+        ev.update(mp_device_fingerprint(auth))
+        return ev
+
+    if kind == "schoolseason":
+        # growth 域 school_season（校园日）判据：mini 指纹 chat_request_send +
+        # activityId=school_open_day_2026（与 school 域开学季同 activityId 关联，
+        # 实测 0ceb9c7c 点亮；无 activityId 的事件不点亮）。直接复用 school 模块
+        # 构造器保证字段与 school 段单一事实源（勿在此手抄第二份形状）。
+        return school.mini_chat_event(auth, f"wb-run-{now}-{idx}")
 
     raise ValueError(f"unknown kind: {kind}")
 
@@ -949,7 +1098,7 @@ def process_school_tasks(auth, opts, stats, uid8):
 
 
 # --------------------------------------------------------------------------
-# 小程序成长任务（growth 域小程序限定，Sequential_Tasks_1）
+# 小程序成长任务（growth 域小程序限定，Sequential_Tasks_1 / school_season）
 # --------------------------------------------------------------------------
 def _mp_list_tasks(auth):
     """带 X-Client-Platform: miniprogram 拉任务列表（小程序限定任务仅在该口径下发）。"""
@@ -970,7 +1119,15 @@ def process_minichat_task(auth, code, opts, stats, uid8):
 
     与 process_task 的 growth 主循环分开处理：该任务在默认（无 mp 头）列表里不存在，
     accept/claim 也要求同一头（缺头 accept 返回 task not found，实测）。
+    适用于同一 mp 下发口径的 Sequential_Tasks_1（判据 kind=minichat，无 activityId）、
+    school_season（判据 kind=schoolseason，mini chat + activityId）、
+    Sequential_Tasks_4（判据 kind=miniautomation，mp automated_task_create_suc）与
+    Sequential_Tasks_5（判据 kind=miniglmchat，mini chat + glm-5.2 模型上下文）——
+    仅上报事件形状不同，链路（accept/claim/回读）完全一致。
+    spec 由 MAPPING 提供，未映射的 mp 任务保守跳过。
     """
+    spec = MAPPING.get(code) or {}
+    kind = spec.get("kind") or "minichat"
     try:
         t = _mp_task_status(auth, code)
     except Exception as e:
@@ -985,12 +1142,22 @@ def process_minichat_task(auth, code, opts, stats, uid8):
     ast = t.get("accept_status")
     prog = t.get("progress") or {}
     cur = prog.get("current") or 0
-    target = prog.get("target") or 1
+    # 未 accept 的 mp 任务 progress 为 null（实测 Sequential_Tasks_3 未激活时全空），
+    # 此时 target 必须由 MAPPING 提供——否则多元任务（Tasks_3 target=5）只会上报 1 次。
+    target = prog.get("target") or spec.get("target") or 1
     stats["total"] += 1
 
     if ast == "claimed":
         print(f"[task_runner] {uid8} {code}: query claimed({cur}/{target}) -> 已领，跳过")
         stats["already"] += 1
+        return
+    # 未到上线时间（服务端 locked + unlock_at，如 Sequential_Tasks_5 的 2026-09-25）：
+    # accept 实测被拒（"task locked until 2026-09-25"），此时上报/claim 均无意义。
+    # 按日期自终止——解锁后同一命令无需改参数即自然开始执行；解锁前记 pending
+    # （可做但条件未到），不记 fail（既非错误也非死任务）。
+    if t.get("locked"):
+        print(f"[task_runner] {uid8} {code}: query locked（解锁 {t.get('unlock_at') or '?'}）-> 未到上线时间，跳过")
+        stats["pending"] += 1
         return
     if ast == "completed" or cur >= target:
         if not opts.yes:
@@ -1001,9 +1168,25 @@ def process_minichat_task(auth, code, opts, stats, uid8):
         return
 
     if not opts.yes:
-        print(f"[task_runner] {uid8} {code}: query {ast}({cur}/{target}) -> 可点亮(mini chat_request_send)，dry-run 跳过")
+        print(f"[task_runner] {uid8} {code}: query {ast}({cur}/{target}) -> 可点亮({kind})，dry-run 跳过")
         stats["pending"] += 1
         return
+
+    # 判据上报的对象 id 先经 ids_for 解析（miniexpert 需真实专家 id，空 id 服务端
+    # 不入账）；无对象 id 的 kind 由 ids_for 返回空的 obj_id/meta，行为与原先一致。
+    # 与 process_task 同口径：ids 为空说明该类任务缺少可用载体，保守不点亮。
+    # 必须在 accept 之前判定——否则会留下「已登记未上报」的半程态（下次仍需 accept
+    # 分支才能补报），宁可整任务不动作。
+    need = max(1, target - cur)
+    ids = ids_for(kind, auth, need, offset=cur)
+    if not ids:
+        print(f"[task_runner] {uid8} {code}: {kind} 无可用对象 id，WARN 跳过点亮")
+        stats["pending"] += 1
+        return
+    if len(ids) < need:
+        # 对象池不够本轮目标（如专家市场返回数少于 need）：按可用数上报，剩余下次补
+        # （回读会如实报出缺口并记 pending，不伪造 id 凑数）。
+        print(f"[task_runner] {uid8} {code}: 可用对象 id {len(ids)} < 需 {need}，本轮按可用数上报")
 
     # 1) accept（mp 头；缺头实测 task not found）
     if ast == "not_accepted":
@@ -1017,12 +1200,12 @@ def process_minichat_task(auth, code, opts, stats, uid8):
             stats["fail"] += 1
             return
 
-    # 2) 判据上报：mini 指纹 chat_request_send（无 activityId），走 codebuddy.cn 域
-    need = max(1, target - cur)
-    for i in range(need):
-        ev = build_event(auth, "minichat", "", {}, i)
-        st, r = school.report_events(auth, [ev])
-        sc = r.get("code") if isinstance(r, dict) else r
+    # 2) 判据上报：mini 指纹事件（minichat/miniglmchat 无 activityId /
+    #    schoolseason 带 activityId；miniexpert/miniautomation 各自事件码），
+    #    走 codebuddy.cn 域（report_mp_event → school.report_events 通道）
+    for i, (obj_id, meta) in enumerate(ids):
+        ev = build_event(auth, kind, obj_id, meta, i)
+        st, sc = report_mp_event(auth, ev)
         print(f"[task_runner] {uid8} {code}: report {i + 1}/{need} {st} code={sc} (mini growth)")
         time.sleep(opts.gap)
 
@@ -1033,15 +1216,18 @@ def process_minichat_task(auth, code, opts, stats, uid8):
     ast2 = t2.get("accept_status")
     prog2 = t2.get("progress") or {}
     cur2 = prog2.get("current", 0)
-    print(f"[task_runner] {uid8} {code}: query re-read {cur2}/{prog2.get('target', target)} accept_status={ast2}")
+    # 回读同样要防 progress: null（键存在但值为 None 时 dict.get 的默认值不生效，
+    # 直接比较会抛 TypeError）；target2 与上面的 target 同口径兜底。
+    target2 = prog2.get("target") or spec.get("target") or 1
+    print(f"[task_runner] {uid8} {code}: query re-read {cur2}/{target2} accept_status={ast2}")
     if ast2 == "claimed":
         print(f"[task_runner] {uid8} {code}: {ast} -> claimed（本轮已入账）")
         stats["already"] += 1
         return
-    if ast2 == "completed" or cur2 >= prog2.get("target", target):
+    if ast2 == "completed" or cur2 >= target2:
         claim_one(auth, code, uid8, stats, opts.gap, mp=True)
         return
-    print(f"[task_runner] {uid8} {code}: report 未达 target（{cur2}/{prog2.get('target', target)}），WARN 待下次")
+    print(f"[task_runner] {uid8} {code}: report 未达 target（{cur2}/{target2}），WARN 待下次")
     stats["pending"] += 1
 
 
@@ -1134,16 +1320,41 @@ def process_task(auth, code, t, opts, stats):
     light_up(auth, code, spec, cur, target, uid8, opts, stats)
 
 
+def _accept_with_verify(auth, code, uid8, gap) -> bool:
+    """accept 并验证登记生效：读 results[].status（而非只看 HTTP 200/msg——
+    实测上游存在 200 + msg=OK 但 status 非 accepted、accept 未真正登记的形态，
+    此时上报事件全部不归账，任务永远点不亮）。
+
+    返回 True=accept 已生效（本轮或此前）；False=重试后仍未生效。
+    判定以回读 accept_status 为准（响应 status 只是初筛）。
+    """
+    for attempt in (1, 2):
+        st, r = tc.accept_tasks(auth, [code])
+        status = ""
+        if isinstance(r, dict):
+            results = ((r.get("data") or {}).get("results") or [])
+            status = (results[0].get("status") or "") if results else (r.get("msg") or "")
+        else:
+            status = str(r)
+        # 回读确认登记生效（响应可能说 accepted 但服务端未落账）
+        t = tc.task_status(auth, code) or {}
+        ast = t.get("accept_status") or "not_accepted"
+        ok = (st == 200 and status == "accepted" and ast != "not_accepted")
+        print(f"[task_runner] {uid8} {code}: accept 尝试{attempt} {st} status={status} "
+              f"回读={ast}{' -> 生效' if ok else ''}")
+        if ok:
+            return True
+        time.sleep(gap)
+    return False
+
+
 def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
-    """accept(若未接) → 按 target 补齐上报 → 回读 → 已满则 claim。"""
+    """accept(若未接，带登记验证与重试) → 按 target 补齐上报 → 回读 → 已满则 claim。"""
     ast = tc.task_status(auth, code)
     ast = ast.get("accept_status") if ast else "not_accepted"
     if ast == "not_accepted":
-        st_a, r_a = tc.accept_tasks(auth, [code])
-        msg = r_a.get("msg") if isinstance(r_a, dict) else r_a
-        print(f"[task_runner] {uid8} {code}: accept {st_a} {msg}")
-        time.sleep(opts.gap)
-        if st_a != 200:
+        if not _accept_with_verify(auth, code, uid8, opts.gap):
+            print(f"[task_runner] {uid8} {code}: accept 未登记生效，本轮跳过待下次")
             stats["fail"] += 1
             return
 
@@ -1278,17 +1489,21 @@ def process_account(auth, opts, stats):
     # 由 process_school_tasks 专段处理，不进 process_task（growth claim 端点对 school 任务 400）。
     # minichat 同理：mp 限定任务在默认口径列表不出现，由 process_minichat_task 专段处理。
     school_in_map = [c for c in MAPPING if MAPPING[c].get("kind") == "school"]
-    minichat_in_map = [c for c in MAPPING if MAPPING[c].get("kind") == "minichat"]
+    minichat_in_map = [c for c in MAPPING
+                      if MAPPING[c].get("kind") in ("minichat", "schoolseason", "miniexpert",
+                                                    "miniautomation", "miniglmchat")]
     special = set(school_in_map) | set(minichat_in_map)
     if opts.only_codes:
         codes = [c for c in opts.only_codes if c not in special]
         process_school = bool(set(opts.only_codes) & set(school_in_map))
         process_minichat = bool(set(opts.only_codes) & set(minichat_in_map))
     else:
-        codes = [c for c in MAPPING if MAPPING[c].get("kind") not in ("school", "minichat")]
+        codes = [c for c in MAPPING
+                 if MAPPING[c].get("kind") not in ("school", "minichat", "schoolseason",
+                                                   "miniexpert", "miniautomation",
+                                                   "miniglmchat")]
         process_school = True
         process_minichat = True
-        process_school = True
         # 未在映射表但存在于任务列表的（如 Expert_Philanthropy）——只计数展示
         for t in tasks:
             c = t.get("task_code")
@@ -1318,17 +1533,21 @@ def process_account(auth, opts, stats):
         if opts.only_claim and not opts.yes:
             pass  # only_claim+dry-run：无写操作，专段内部自行按 dry-run 跳过
         else:
-            try:
-                t = _mp_task_status(auth, "Sequential_Tasks_1")
-                ast = (t or {}).get("accept_status")
-                if opts.only_claim and ast not in ("completed",) and (t or {}).get("accept_status") != "claimed":
-                    # only_claim 只入账已完成任务；未完成不点亮
-                    print(f"[task_runner] {uid8} Sequential_Tasks_1: only_claim 跳过（未 completed）")
-                else:
-                    process_minichat_task(auth, "Sequential_Tasks_1", opts, stats, uid8)
-            except Exception as e:
-                print(f"[task_runner] {uid8} Sequential_Tasks_1: mp 查询失败: {e}")
-                stats["fail"] += 1
+            # --only 语义：指定了 mp code 时只跑指定的（与 growth/school 段一致）
+            mp_codes = ([c for c in opts.only_codes if c in minichat_in_map]
+                        if opts.only_codes else minichat_in_map)
+            for mp_code in mp_codes:
+                try:
+                    t = _mp_task_status(auth, mp_code)
+                    ast = (t or {}).get("accept_status")
+                    if opts.only_claim and ast not in ("completed", "claimed"):
+                        # only_claim 只入账已完成任务；未完成不点亮
+                        print(f"[task_runner] {uid8} {mp_code}: only_claim 跳过（未 completed）")
+                    else:
+                        process_minichat_task(auth, mp_code, opts, stats, uid8)
+                except Exception as e:
+                    print(f"[task_runner] {uid8} {mp_code}: mp 查询失败: {e}")
+                    stats["fail"] += 1
 
     # school 段（小程序开学季）：growth 任务循环之后执行，判据/端点全复用 school 模块。
     # --only-claim 语义下跳过：school 无「已 completed 未领」的 only_claim 快路径，

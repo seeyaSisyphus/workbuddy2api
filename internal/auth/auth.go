@@ -50,12 +50,66 @@ func (a *Auth) Lock() { a.mu.Lock() }
 // Unlock 释放 a.Lock 获取的锁。
 func (a *Auth) Unlock() { a.mu.Unlock() }
 
+// AccessTokenValue 加锁读取 AccessToken（出站请求头一律经此取值，勿直读字段）。
+//
+// 为什么必须加锁：RefreshToken 在 a.mu 内改写 AccessToken/RefreshToken/Domain/ExpiresAt
+// （client.go「第 2 段（锁内）：校验快照一致后写回」），而所有出站请求头构造
+// （ChatHeaders / BillingHeaders / fetchEnterpriseModels / fetchV3Models /
+// global_models）与调度器的 token 检查都在锁外直读这些字段。生产上两侧真会并发：
+// Scheduler.RunKeepaliveNow 定时对**每个**非禁用账号刷新（与是否有在途请求无关），
+// 而 handler 正基于**同一个** *auth.Auth 指针构造请求头（Pool.AuthByUID/List 返回的
+// 就是池内同一个对象）。无同步直读构成数据竞争（上游 910b8b2 以 go test -race 实证）。
+func (a *Auth) AccessTokenValue() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.AccessToken
+}
+
+// DomainValue 加锁读取 Domain（同 AccessTokenValue：RefreshToken 在锁内改写它）。
+func (a *Auth) DomainValue() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.Domain
+}
+
+// RefreshTokenValue 加锁读取 RefreshToken（同 AccessTokenValue：RefreshToken 在锁内
+// 改写它，上游 855e5b9）。调度器的「有无凭证」前置守卫（checkin/keepalive/travel 的
+// `a.RefreshToken == ""`）必须经此取值，勿直读字段。
+func (a *Auth) RefreshTokenValue() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.RefreshToken
+}
+
+// ExpiresAtValue 加锁读取 access token 的到期时刻（Unix 秒）。RefreshToken 在锁内
+// 改写它，故跨包只读也必须经此取值（同 AccessTokenValue/DomainValue/RefreshTokenValue）。
+func (a *Auth) ExpiresAtValue() int64 {
+	if a == nil {
+		return 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ExpiresAt
+}
+
 // globalEnabled 全局开关：global realm 是否路由（D5 双保险）。
 // 默认开启（与 config global.enabled 缺省 true 一致）：Realm() 正常按显式 realm/
 // domain 判定 global/cn。显式 SetGlobalEnabled(false)（config "enabled": false）关闭
 // → 逃生门：纯 CN 部署，即便 auth 文件写了 realm=global 或 domain 为 .workbuddy.ai
 // 也恒判 cn——「关了才锁死」的单一闸口集中收敛在 Realm()/IsGlobal() 里。
 var globalEnabled atomic.Bool
+
+// saveTmpSeq SaveAtomic 临时文件名序号源（与 pid 合成唯一 tmp 名，见 SaveAtomic）。
+var saveTmpSeq uint64
 
 func init() { globalEnabled.Store(true) }
 
@@ -69,7 +123,18 @@ func GlobalEnabled() bool { return globalEnabled.Load() }
 // 否则 "cn"。显式 global 优先于 domain 回落（D1）。
 // 全局开关 SetGlobalEnabled(false) 时恒 "cn"（逃生门：纯 CN 锁定，不影响默认行为）。
 // 空 realm + 空 domain → "cn"（老 CN 凭证零回归）。
+//
+// 加锁读取（上游 910b8b2）：realm 由 BackfillRealm 改写、Domain 由 RefreshToken 在
+// a.mu 内改写，读取必须与写方同锁。
 func (a *Auth) Realm() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.realmLocked()
+}
+
+// realmLocked Realm 的无锁内部实现：仅限**已持 a.mu** 的调用方使用（sync.Mutex
+// 不可重入，锁内再调 Realm() 会自锁）。
+func (a *Auth) realmLocked() string {
 	if !globalEnabled.Load() {
 		return "cn"
 	}
@@ -98,7 +163,10 @@ func ResolveRealm(explicit, domain string) string {
 // 注意用 isGlobalDomain(a.Domain) 直接推断，而非 Realm()——Realm() 在逃生门
 // （SetGlobalEnabled(false)）下恒降级 cn，把 global 账号写死成 cn 会永久污染凭证
 // （逃生门是纯 CN 部署的临时锁，不应改写落盘数据）。domain 也为空时写 "cn"（老 CN 凭证）。
+// 加锁（上游 910b8b2）：与 Realm() 的加锁读取对称，写 realm 必须持锁。
 func (a *Auth) BackfillRealm() (bool, string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if strings.TrimSpace(a.realm) != "" {
 		return false, a.realm
 	}
@@ -108,7 +176,12 @@ func (a *Auth) BackfillRealm() (bool, string) {
 }
 
 // RealmStored 直读持久化的 realm 标识（可能为空 = 未 backfill 的旧文件，Realm() 会 fallback）。
-func (a *Auth) RealmStored() string { return a.realm }
+// 加锁（上游 910b8b2）：与 BackfillRealm 的写对称。
+func (a *Auth) RealmStored() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.realm
+}
 
 // IsGlobal 报告账号是否属于 global realm（= Realm() == "global"）。
 func (a *Auth) IsGlobal() bool { return a.Realm() == "global" }
@@ -121,7 +194,10 @@ func isGlobalDomain(d string) bool {
 }
 
 // NeedsRefresh 报告 token 是否将在 within 内过期（或已过期/无 expiry）。
+// 加锁（上游 910b8b2）：ExpiresAt 由 RefreshToken 在锁内改写，锁外直读构成竞争。
 func (a *Auth) NeedsRefresh(within time.Duration) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if a.ExpiresAt <= 0 {
 		return true
 	}
@@ -241,7 +317,10 @@ func (a *Auth) SaveAtomic() error {
 	if err != nil {
 		return err
 	}
-	tmp := a.FilePath + ".tmp"
+	// tmp 名带 pid + 序号：同进程可能出现同一 FilePath 的多个 Auth 实例
+	// （热加载 LoadDir 新建对象与池内旧对象并存），固定 .tmp 名会互相覆盖
+	// 并让先到者的 rename 撞 ENOENT 丢写（评审修复）。
+	tmp := fmt.Sprintf("%s.tmp.%d.%d", a.FilePath, os.Getpid(), atomic.AddUint64(&saveTmpSeq, 1))
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		return err
 	}
@@ -272,21 +351,34 @@ func LoadAuthFiles(dir string) ([]string, error) {
 // 落盘，一次性把旧文件补上 realm 键。单个文件写失败不阻断启动（log WARN 继续），
 // 避免历史 auth 目录个别文件不可写时整个服务起不来。
 func LoadDir(dir string) ([]*Auth, error) {
+	auths, _, err := LoadDirDetailed(dir)
+	return auths, err
+}
+
+// LoadDirDetailed 同 LoadDir，但额外返回被跳过（读失败/解析失败）的文件数——
+// 供 auths 热加载判定「目录内容是否完整可判」（pool/watch.go）：跳过数 >0 说明
+// 目录里可能有半写入/瞬时不可读的文件，此时**不可**用加载结果做「消失账号剔除」
+// （SyncToDir 会按缺失删除并落盘，把 state.json 里的 credits/冷却/熔断计数抹掉）。
+// 返回值：解析成功的账号、跳过文件数、目录级错误（Glob 失败）。
+func LoadDirDetailed(dir string) ([]*Auth, int, error) {
 	files, err := LoadAuthFiles(dir)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	// seenUID 重复 UID 检测：同 UID 出现在多个文件时（双 realm 同名 UID 概率近零）
 	// 打 WARN 告警含两文件路径，由「后载入者胜出」保持现状行为（不改变加载结果）。
 	seenUID := make(map[string]string, len(files))
 	var out []*Auth
+	skipped := 0
 	for _, f := range files {
 		raw, err := os.ReadFile(f)
 		if err != nil {
+			skipped++
 			continue
 		}
 		a, err := Parse(raw)
 		if err != nil {
+			skipped++
 			continue
 		}
 		a.FilePath = f
@@ -306,5 +398,5 @@ func LoadDir(dir string) ([]*Auth, error) {
 		}
 		out = append(out, a)
 	}
-	return out, nil
+	return out, skipped, nil
 }

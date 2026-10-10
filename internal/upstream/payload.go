@@ -41,6 +41,12 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 		return src
 	}
 	obj["stream"] = true
+	// max_completion_tokens → max_tokens 翻译（上游 edb9e97 吸收 PR #116，Closes #117）：
+	// OpenAI 规范里 max_tokens 已 deprecated、max_completion_tokens 是新字段
+	// （o-series 起引入）；DeepSeek Harness 等新客户端只发别名。WorkBuddy 上游
+	// 只认 max_tokens——别名透传会被上游忽略后回落默认输出上限（上游实测 32000），
+	// 长流任务被截。两域同口径（CN /v2 与 global 是同一套 API 的两次部署）。
+	translateMaxCompletionTokens(obj)
 	// stream_options 仅当 body 未显式带时补 {include_usage: true}（D7）：
 	// 官方 CLI 流式必发该字段，上游据此在末帧返回 usage 用量；显式带则不覆盖。
 	if _, has := obj["stream_options"]; !has {
@@ -48,13 +54,20 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	}
 	normalizeToolChoice(obj)
 	normalizeRoles(obj)
-	// 孤儿 tool_call↔tool 配对清理（见 tool_pairing.go）：所有模型一律执行（独立于
+	// image_url 归一化（上游 c5cdb46）：上游只认 OpenAI 对象形态，字符串会 400 code=11101。
+	normalizeImageURL(obj)
+	// tool 配对两步（见 tool_pairing.go）：先重排再清理。所有模型一律执行（独立于
 	// deepseek-only 的 sanitize 开关）。这是「让请求通过」的安全网——不完整配对的
-	// tool_calls/tool 结果会让上游对之后每条消息都返 400，必须先行剔除。
+	// tool_calls/tool 结果会让上游对之后每条消息都返 400，必须先行剔除；
+	// 插在结果中间的非 tool 消息（Codex image_resize_notice）同样判配对断裂（11148），
+	// 先 repack 挪后，再 cleanup 删孤儿，两侧同口径（上游 155af65）。
 	if msgs, ok := obj["messages"].([]any); ok {
-		if cleaned, ch := cleanupOrphanToolCalls(msgs); ch {
-			obj["messages"] = cleaned
-		}
+		msgs, _ = repackToolResultBlocks(msgs)
+		msgs, _ = cleanupOrphanToolCalls(msgs)
+		// 无改动时两步都返回原 slice，这里回写等于零操作；任一步重排/删除
+		// （哪怕后续步骤零改动）也必须落到 obj——不能只在「最后一步改动」时回写，
+		// 否则 repack 单独生效的结果会被原 slice 覆盖丢失。
+		obj["messages"] = msgs
 	}
 	// DeepSeek 思维链开关（见 thinking.go）：注入 thinking.type=enabled + 缺档补默认档。
 	// 先于 normalizeReasoningEffort 执行：补入的默认档也要走既有降级管线，
@@ -77,8 +90,74 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	return out
 }
 
+// normalizeImageURL 兼容 OpenAI chat 多模态内容的两种 image_url 写法（上游 c5cdb46）：
+// 规范形态是 {"type":"image_url","image_url":{"url":"..."}}，但部分客户端直接给
+// 字符串（{"type":"image_url","image_url":"https://..."}）。上游只认对象形态，
+// 字符串形态会被 400 code=11101 拒绝（请求级错误，换号无用）。
+// 仅当 image_url 为非空字符串时包装为对象；已是对象/缺失/空串一律不动（零改动）。
+func normalizeImageURL(obj map[string]any) {
+	msgs, ok := obj["messages"].([]any)
+	if !ok {
+		return
+	}
+	for _, rawMsg := range msgs {
+		msg, ok := rawMsg.(map[string]any)
+		if !ok {
+			continue
+		}
+		parts, ok := msg["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, rawPart := range parts {
+			part, ok := rawPart.(map[string]any)
+			if !ok || part["type"] != "image_url" {
+				continue
+			}
+			imageURL, ok := part["image_url"].(string)
+			if !ok || imageURL == "" {
+				continue
+			}
+			part["image_url"] = map[string]any{"url": imageURL}
+		}
+	}
+}
+
 // effortRank 档位从低到高。
 var effortRank = map[string]int{"off": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6}
+
+// translateMaxCompletionTokens 把 OpenAI 别名 max_completion_tokens 翻译为上游
+// 认的 max_tokens（上游 edb9e97 吸收 PR #116）。调用点在 stream 强制之后
+// （同一预处理管线挂载）。规则：显式 max_tokens 优先（别名只删）；别名非正数值
+// （0/null/负数）不翻译（0/null 语义是「未设置」走上游默认）；非数值别名（字符串
+// 等畸形）不翻译（原样透传由上游报 11101 参数错）。别名一律删（减 body 体积与
+// 排障噪音）。两域同口径：CN /v2 与 global 是同一套 API，翻译不分 realm。
+func translateMaxCompletionTokens(obj map[string]any) {
+	alias, has := obj["max_completion_tokens"]
+	delete(obj, "max_completion_tokens") // 无论翻译与否，别名一律删（见上方注释）
+	if !has {
+		return
+	}
+	if _, explicit := obj["max_tokens"]; explicit {
+		return // 显式 max_tokens 优先：别名只删不译
+	}
+	// json.Unmarshal 数字 → float64（整数去整后回写，避免科学计数法/小数尾巴进
+	// 上游 body）；其他数值类型防御性兼容（int 家族——手构造 map 的调用方）。
+	switch v := alias.(type) {
+	case float64:
+		if v > 0 && v == float64(int64(v)) {
+			obj["max_tokens"] = int64(v)
+		}
+	case int64:
+		if v > 0 {
+			obj["max_tokens"] = v
+		}
+	case int:
+		if v > 0 {
+			obj["max_tokens"] = int64(v)
+		}
+	}
+}
 
 // normalizeReasoningEffort 按模型 supportedEfforts 降级 reasoning_effort（snake/camel 双字段兼容）。
 //   - 请求档位模型支持 → 原样透传

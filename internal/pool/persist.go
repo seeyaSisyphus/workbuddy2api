@@ -35,8 +35,14 @@ type StoreSnapshotter interface {
 }
 
 // RestoreFromSnapshot 择新恢复：比较本地 state.json 与 Redis 快照，采用较新者。
-// 无快照、快照无 savedAt、或本地不存在/不可读时，都会被判定为"本地优先/跳过快照"，
-// 同时打一条恢复来源日志。必须在 SyncToDir 之前调用（SyncToDir 只增删不入值）。
+//
+// 本地**可用**时按新旧择一（快照不早于本地 → 采用快照，否则本地优先）；本地**不可用**
+// （state.json 缺失或不可读，典型为首次在新卷/新节点启动）时**采用快照**（上游 d2cd004）——
+// 此时本地根本没有可"优先"的状态，快照是本轮唯一的运行态来源，这正是快照作为
+// 「启动恢复备份」的核心场景。分支情形：无快照 / 快照无 savedAt → 本地优先（无判据可比）。
+//
+// 每种情形都打一条对应的恢复来源日志，便于对账。必须在 SyncToDir 之前调用
+// （SyncToDir 只增删不入值：值只能来自本地 load 或本函数采用快照）。
 func (p *Pool) RestoreFromSnapshot() {
 	store := p.store
 	if store == nil || p.stateFp == "" {
@@ -56,15 +62,28 @@ func (p *Pool) RestoreFromSnapshot() {
 		log.Printf("[pool] 恢复来源=本地 state.json（Redis 快照无 saved_at）")
 		return
 	}
-	if localErr == nil && !localInfo.ModTime().After(snap.SavedAt) {
+	if localErr != nil || !p.localStateUsable.Load() {
+		// 本地不可用 → 采用快照（本地没有可"优先"的状态）。两种形态同待遇：
+		//   - localErr != nil：state.json 缺失/不可读（新卷首启）；
+		//   - 文件存在但 load() 解析失败（损坏）：本地同样没有可用状态（评审修复——
+		//     旧判据只看 Stat，损坏文件仍走"本地较新"分支把快照丢弃）。
+		//
+		// 旧实现把该情形与「本地较新」合并成同一个 fall-through：既不改内存、不置 dirty
+		//（有效快照被静默丢弃），又打出"本地 state.json（较新于 Redis 快照 …）"——一次
+		// 从未发生过的比较；随后 SyncToDir 只增删不入值，全池运行态
+		//（credits/冷却/熔断计数/usedSeq/lastUsed）被清零。
+		p.adoptSnapshot(snap)
+		log.Printf("[pool] 恢复来源=Redis 快照 (saved_at=%s)（本地 state.json 不可用: err=%v usable=%v）",
+			snap.SavedAt.Format(time.RFC3339), localErr, p.localStateUsable.Load())
+		return
+	}
+	if !localInfo.ModTime().After(snap.SavedAt) {
 		// 快照不早于本地 → 采用快照。
-		p.mu.Lock()
-		p.applySnapshotLocked(snap)
-		p.mu.Unlock()
-		p.dirty.Store(true)
+		p.adoptSnapshot(snap)
 		log.Printf("[pool] 恢复来源=Redis 快照 (saved_at=%s)", snap.SavedAt.Format(time.RFC3339))
 		return
 	}
+	// 走到这里必然是「本地存在且严格新于快照」，日志结论属实。
 	log.Printf("[pool] 恢复来源=本地 state.json（较新于 Redis 快照 %s）", snap.SavedAt.Format(time.RFC3339))
 }
 
@@ -115,6 +134,9 @@ func (p *Pool) Flush() {
 
 // load 从本地 state.json 读回持久化状态（无文件/解析失败静默跳过，零状态启动）。
 // New 构造时调用；恢复用 placeholder 凭证，Add/SyncToDir 时换全。
+// load 读取本地 state.json 并恢复账号状态。成功（读+解析均过）置
+// localStateUsable——RestoreFromSnapshot 据此把「文件存在但损坏」与「文件缺失」
+// 同待遇（本地无可"优先"状态，采用 Redis 快照，评审修复）。
 func (p *Pool) load() {
 	raw, err := os.ReadFile(p.stateFp)
 	if err != nil {
@@ -122,9 +144,11 @@ func (p *Pool) load() {
 	}
 	var sf stateFile
 	if json.Unmarshal(raw, &sf) != nil {
+		log.Printf("WARN: [pool] 本地 state.json 解析失败（文件损坏？），将交由 Redis 快照择新恢复判定")
 		return
 	}
 	p.applyAccountsLocked(sf.Accounts)
+	p.localStateUsable.Store(true)
 }
 
 // applyAccountsLocked 用持久化账号状态覆盖/插入 byUID（placeholder 凭证，Add 时换全）。
@@ -204,6 +228,15 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 	}
 }
 
+// adoptSnapshot 采用 Redis 快照为当前池状态，并置 dirty 让下一次落盘把它物化回本地
+// state.json（否则快照只在内存生效，下次崩溃恢复又回到旧本地文件）。
+func (p *Pool) adoptSnapshot(s snapshot) {
+	p.mu.Lock()
+	p.applySnapshotLocked(s)
+	p.mu.Unlock()
+	p.dirty.Store(true)
+}
+
 // applySnapshotLocked 用 Redis 快照覆盖内存状态（已在择新判定后采用）。调用方必须已持有 p.mu。
 func (p *Pool) applySnapshotLocked(s snapshot) {
 	p.byUID = map[string]*entry{}
@@ -234,6 +267,9 @@ func (p *Pool) saveLocked() {
 		p.notePersistFail(err)
 		return
 	}
+	// 落盘成功即本地文件可用（评审修复）：首启文件缺失（load 未置位）后 Flush
+	// 写出首个可用 state.json，此后 RestoreFromSnapshot 的判据应反映"本地可用"。
+	p.localStateUsable.Store(true)
 	if p.persistFails > 0 {
 		// 从连续失败中恢复：打一条恢复日志，避免"错误打完却无人知道已恢复"。
 		log.Printf("[pool] state.json 落盘恢复（此前连续失败 %d 次）", p.persistFails)

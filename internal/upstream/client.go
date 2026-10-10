@@ -5,11 +5,13 @@ package upstream
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"regexp"
 	"strings"
@@ -35,6 +37,8 @@ const (
 	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
 	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避（WAF 403 修复 P0-1）
+	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
+	ErrImageInvalid                  // 图片请求格式/数据无效（11135 等）→ 请求级错误：不罚号、不轮转，末端透传原文
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -60,6 +64,10 @@ func (k ErrKind) String() string {
 		return "model_blocked"
 	case ErrWafBlock:
 		return "waf_block"
+	case ErrPromptTooLong:
+		return "prompt_too_long"
+	case ErrImageInvalid:
+		return "image_invalid"
 	case ErrClient:
 		return "client"
 	default:
@@ -201,16 +209,54 @@ var badParamsRule = errorRule{kind: ErrBadParams, mode: matchExact, patterns: []
 	`"code":11133`,
 	`model_param_invalid`,
 	`integer_below_min_value`,
-	// 11115「prompt is too long: N tokens > M maximum」：输入（新输入+历史对话）超过模型
-	// 上下文上限。这是**客户端侧**错误（精简内容或新建任务才可能成功，原样重试必然同样
-	// 失败），上游自带中文 displayMsg/displayTips 说明，透传即可让客户端直接展示。
-	// 2026-10-01 收录：此前不被任何规则识别 → 落 ErrClient → 出口按默认值输出
-	// 503 no_healthy_account，把"内容太长"谎报成"网关没有可用账号"，客户端据此无意义重试。
-	// 判定用 msg 短语为主、code 为辅：上游该 code 名下另有语义（见 sanitize.go 注释），
-	// "prompt is too long" 是本类的权威文案。
-	"prompt is too long",
-	`"code":11115`,
 }}
+
+// promptTooLongRule 11115「prompt is too long」判定（上游 5f26ce3 专项分类移植）。
+//
+// 定位：输入（新输入+历史对话）超过模型上下文上限。这是**请求级**错误——同一
+// body 换任何账号都会超限，轮转白扔健康号配额；上游自带中文 displayMsg/displayTips
+// 说明，透传即可让客户端直接展示（精简内容或新建任务才可能成功）。
+//
+// 判定用 msg 短语为主、code 为辅：上游该 code 名下另有语义（见 sanitize.go 注释），
+// "prompt is too long" 是本类的权威文案；code 通道覆盖上游换措辞的形态。
+// 此前该错误被 badParamsRule 收录（归 ErrBadParams → 400 invalid_request_error），
+// 本次拆出独立 kind 以便末端回 prompt_too_long 语义化错误码。
+var promptTooLongRule = errorRule{kind: ErrPromptTooLong, mode: matchFold, patterns: []string{
+	`"code":11115`,
+	`"code":"11115"`,
+	"prompt is too long",
+}}
+
+// isPromptTooLongStatus 11115 只在请求级 4xx 上判：429/5xx 语义（限流/服务端故障）
+// 优先，由各自状态码层先行短路；413 是网关侧历史上曾出现过的超限形态。
+func isPromptTooLongStatus(status int) bool {
+	return status == http.StatusBadRequest || status == http.StatusNotFound ||
+		status == http.StatusRequestEntityTooLarge
+}
+
+// invalidImageRule 图片请求格式/数据无效（HTTP 400）的**文案**形态。这类错误由
+// 请求体决定（图片 URL 失效/数据损坏），换账号结果不变——必须 fail-fast，否则
+// 会把健康账号轮转一遍后仍把末端 503 返回给客户端。
+//
+// 业务码 11135（"Invalid image_url content"）另有 JSON 空白形态（`"code": 11135`），
+// 字面量 marker 只能覆盖紧凑形态，故统一走 codeMarker（见 Classify 的 400 分支）。
+var invalidImageRule = errorRule{kind: ErrImageInvalid, mode: matchFold, patterns: []string{
+	"invalid image_url content",
+	"invalid_image_data",
+	"replace the image",
+}}
+
+// codeMarker 报告 body（已小写）是否含 `"code":<code>` 的常见 JSON 形态（容忍
+// 冒号两侧空白与引号包裹；上游 11135/11133 等业务码曾以 `"code": 11135` 形态出现）。
+// 上游实现位于 hint.go（随 a749016 引入）；本地无 hint.go，按最小依赖内联于此。
+func codeMarker(lower, code string) bool {
+	for _, v := range []string{`"code":` + code, `"code": ` + code, `"code":"` + code + `"`, `"code": "` + code + `"`, `"code":" ` + code + `"`, `"code": '` + code + `'`} {
+		if strings.Contains(lower, v) {
+			return true
+		}
+	}
+	return false
+}
 
 // alreadyCheckinRule "今天已签到"关键词（上游对重复签到返回 code!=0，
 // 实测 code=10001/14001 "今天已签到"/"今日已签到"）。只对 *Error.Msg 做包含匹配，
@@ -457,41 +503,89 @@ func ParseRateReset(body string) (time.Time, bool) {
 	return t, true
 }
 
+// hasBusinessCode 报告 JSON 错误信封中是否存在精确等于 want 的业务 code 字段
+// （上游信封有顶层与嵌套 error/data 两种形态，遍历解码后的结构；非 JSON 直接 false）。
+// 14018（账号积分耗尽）用结构化 code 判定，不靠可能跨计费/限流两界的文案猜测。
+func hasBusinessCode(body, want string) bool {
+	var root any
+	if err := json.Unmarshal([]byte(body), &root); err != nil {
+		return false
+	}
+	var walk func(any) bool
+	walk = func(value any) bool {
+		switch node := value.(type) {
+		case map[string]any:
+			if code, ok := node["code"]; ok && strings.TrimSpace(fmt.Sprint(code)) == want {
+				return true
+			}
+			for _, child := range node {
+				if walk(child) {
+					return true
+				}
+			}
+		case []any:
+			for _, child := range node {
+				if walk(child) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return walk(root)
+}
+
 // Classify 按 HTTP 状态码 + body 判定错误类别。
 //
 // 判定顺序自「严」到「宽」，每层的先后都有语义依据：
 //  0. 11102（IsModelBlocked）——「该后端无此模型」确定性答复，语义最具体，最先判
-//     （详见 IsModelBlocked 注释）。
-//  1. 402 / hardRule —— 计费额度耗尽，最严、最不可自愈，必须最先判。
-//     "quota exceeded" 语义跨计费/限流两界，历史归 hard_credit，本次保持不变
-//     （issue #28 已记录该反向误判风险，待上游原始响应确认后再定）。
+//     （详见 IsModelBlocked 注释；只认 400/404，429+11102 属限流语义走 429 层）。
+//  1. 402 —— 真正的计费余额耗尽状态码，最严、最不可自愈，最先判。
 //  2. sessionDeadRule —— 需要人工重登的终态。若 401 body 同时含 "12153" 与
 //     "rate limit"（如网关错误页混排），归 session_dead：短冷却救不活失效 session，
 //     误判为限流会让该死号留在池中反复被选中；且此层 marker 是精确词（12153 等），
 //     比限流层的大范围子串更具体，具体优先于宽泛。
 //  3. accountFaultRule —— 账号级授权/配额故障（11140 request illegal auth 风控、
 //     14017 trial not activated register 未完成）。与 429 一起纳入轮换冷却，且必须
-//     先于 softRate/status429 判定：14017 常带 429 状态码，若落到 status==429 兜底
-//     会误归 soft_rate（"限流"语义不符：限流可指数退避等自愈，账号级故障等不来）。
+//     先于 status==429 判定：14017 常带 429 状态码，若落到 status==429 会误归
+//     soft_rate（"限流"语义不符：限流可指数退避等自愈，账号级故障等不来）。
 //     11140 的 model 级限流变体（rate-limiting 文案）因 marker 不含该文案而天然
 //     落到 softRateRule 层，不受影响。
-//  4. softRateRule —— 非 429 状态码携带限流文案（issue #28 修复点）。
-//     位于此处可覆盖 200/400/403/5xx 各状态码；429 且 body 含文案时在此短路，
-//     结果同为 soft_rate，与下一层一致。
-//  5. status==429 —— body 无文案时的兜底识别。
-//  6. 404 / 5xx —— 与限流无关的常规分类。
-//  7. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
+//  4. 429 + code 14018 —— 明确的账号积分耗尽，归 ErrHardCredit（上游 issue #175）。
+//     只认结构化业务码，不靠可能跨计费/限流两界的文案猜测。
+//  5. status==429 —— 限流状态码兜底（上游 fork-scan-absorb T-3）：429 body
+//     高频携带 "quota exceeded"/"额度不足" 等跨计费/限流两界的措辞，若 hardRule
+//     先判会把限流误归 ErrHardCredit 硬冷却到次日 04:00，白扔号约 12h。状态码是
+//     比关键词更权威的信号：上游既然给了 429，就按限流语义处理（宁可短冷却自愈，
+//     不可长冷却弃号）；真正的余额耗尽由 402（第 1 层）或 14018（第 4 层）捕获，
+//     非 429 状态码的 quota 措辞仍走下方 hardRule（第 6 层）。
+//  6. hardRule —— 非 429 响应携带计费关键词（200 业务信封 / 403 信封等）。
+//     "quota exceeded" 语义跨计费/限流两界，历史归 hard_credit；429 场景已由
+//     第 5 层前置接管（issue #28 记录的非 429 反向误判风险保持原样，待上游
+//     原始响应确认后再定）。
+//  7. softRateRule —— 非 429 状态码携带限流文案（issue #28 修复点）。
+//     位于此处可覆盖 200/400/403/5xx 各状态码；429 且 body 含文案时已被第 5 层
+//     短路，结果同为 soft_rate。
+//  8. 11115 prompt too long —— 请求级语义最具体（上下文超限），判在 404/5xx/
+//     WAF/内容策略/参数错误/通用 4xx 之前（404 兜底会误归 ErrNotFound 只冷却
+//     不透传；ErrClient 只换号，浪费健康号配额）。429/5xx 在上方已被各自状态码
+//     层短路（限流/服务端故障语义优先）。
+//  9. 404 / 5xx —— 与限流无关的常规分类。
+//  10. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
 //     拦截形态（WAF 403 修复 P0-1）。判在通用 4xx 兜底**之前**：此前该形态落
 //     ErrClient → applyErrorPolicy 只换号不罚 → 连环 403（报告 §4.1 的根因）。
-//     带业务信封的 403 已被上方 1-5 层捕获（11140 request illegal →
+//     带业务信封的 403 已被上方各层捕获（11140 request illegal →
 //     ErrAccountFault 禁用语义不变），走不到本层。
-//  8. 内容策略/参数错误/其他 4xx —— 通用兜底。
+//  11. 11135 图片无效 —— 请求级确定性错误：同 body 换账号结果不变，fail-fast
+//     避免把健康账号轮转一遍后仍把末端 503 返回给客户端。
+//  12. 内容策略/参数错误/其他 4xx —— 通用兜底。
 func Classify(status int, body string) ErrKind {
 	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
 	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 虽不含余额词、
 	// 但可能被更宽的 4xx 兜底归为 ErrClient（只换号不避让），该坏号会留在池内反复被选中。
 	// 先于 hardRule：11102 答复的 msg 是模型不存在，不含 credit/quota/积分 等计费词，
 	// 正常不会撞 hardRule，但前置判定让语义零歧义（防上游未来在 msg 里混入余额词）。
+	// 只认 400/404（见 IsModelBlocked），429+11102 落下方 status==429 层走限流语义。
 	if IsModelBlocked(status, body) {
 		return ErrModelBlocked
 	}
@@ -499,20 +593,39 @@ func Classify(status int, body string) ErrKind {
 		return ErrHardCredit
 	}
 	lower := strings.ToLower(body)
-	if hardRule.hit(body, lower) {
-		return ErrHardCredit
-	}
+	// sessionDead / accountFault 先于 status==429（原顺序已如此，此处只是跟随
+	// 429 前移保持相对次序）：账号级终态等不来自愈，限流状态码不得掩盖它们
+	// （429+14017 必须 accountFault，401+12153 混排 "rate limit" 必须 sessionDead）。
 	if sessionDeadRule.hit(body, lower) {
 		return ErrSessionDead
 	}
 	if accountFaultRule.hit(body, lower) {
 		return ErrAccountFault
 	}
+	// 14018 是明确的账号积分耗尽业务码。它必须先于通用 429 兜底，否则会被误判为
+	// 可自愈的软限流并在全池冷却时反复兜底选中（上游 issue #175）。仅按结构化 code
+	// 判定；无该 code 的 "credits exhausted" 文案仍保持普通 429 的软限流语义。
+	if status == http.StatusTooManyRequests && hasBusinessCode(body, "14018") {
+		return ErrHardCredit
+	}
+	// status==429 先于 hardRule（fork-scan-absorb T-3）：限流响应 body
+	// 高频携带 "quota exceeded"/"额度不足" 等跨两界措辞，hardRule 先判会误归
+	// ErrHardCredit 硬冷却到次日 04:00。402 真余额在上层已判；非 429 的 quota
+	// 措辞仍走下方 hardRule，历史语义不变。
+	if status == http.StatusTooManyRequests {
+		return ErrSoftRate
+	}
+	if hardRule.hit(body, lower) {
+		return ErrHardCredit
+	}
 	if softRateRule.hit(body, lower) {
 		return ErrSoftRate
 	}
-	if status == http.StatusTooManyRequests {
-		return ErrSoftRate
+	// 11115「prompt is too long」：判在 404/5xx/WAF/内容策略/参数错误/通用 4xx
+	// 之前——请求级语义最具体（上下文超限），须先于宽泛的状态码兜底。
+	// 只认请求级 4xx 状态码（见 isPromptTooLongStatus），429/5xx 在上方已短路。
+	if isPromptTooLongStatus(status) && promptTooLongRule.hit(body, lower) {
+		return ErrPromptTooLong
 	}
 	if status == http.StatusNotFound {
 		return ErrNotFound
@@ -527,13 +640,20 @@ func Classify(status int, body string) ErrKind {
 	if IsWafBlocked(status, body) {
 		return ErrWafBlock
 	}
+	// 图片格式/数据错误是确定性的请求级错误：同 body 换账号结果不变，直接
+	// fail-fast，避免把健康账号轮转一遍后仍把最终 503 返回给客户端。
+	// 业务码 11135 经 codeMarker 而非字面量 marker：上游 JSON 含空白
+	// （`"code": 11135`）时字面量 marker 会漏判，导致退化成 ErrClient 并继续轮转。
+	if status == http.StatusBadRequest && (invalidImageRule.hit(body, lower) || codeMarker(lower, "11135")) {
+		return ErrImageInvalid
+	}
 	// 内容策略拦截（HTTP 400 + 审核文案）：判在通用 ErrClient 之前。
 	// 这是误报信号，不罚账号，由网关降级重试处理（见 handler.applyErrorPolicy）。
 	// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：
 	// 这是"发给上游的 body 有问题"。网关侧截断已由 413 消灭（issue #41 commit A），
 	// 剩余来源是客户端 JSON 本身畸形——换了账号照样 400，不该罚号（白白冷却好号）。
-	// 归 ErrBadParams：不冷却/不熔断/不计错，但**仍然轮转**（不同账号可能有不同的
-	// 模型权限，值得再试一次）。
+	// 归 ErrBadParams：不冷却/不熔断/不计错，且**不轮转**（2026-10-01 实测：
+	// 同一请求轮转 3 账号全部 11133，成功率 0%，白烧上游调用）。
 	if status >= 400 {
 		if contentBlockedRule.hit(body, lower) {
 			return ErrContentBlocked
@@ -648,16 +768,94 @@ type Client struct {
 	GlobalEnabled bool
 }
 
+// 出站 Transport 连接层参数（上游 3d9a4cc 连接层加固，本地按 hanawa/master 移植）：
+// 集中定义、测试可回读断言（与 server/backoff.go 同风格）。
+const (
+	// dialTimeout TCP 连接建立上限。半死连接的第一道闸：连不上就快速失败
+	// 轮转换号，不再干等系统 TCP 重传窗口（上游实测半开 TCP 单次 TTFB 卡 936s——
+	// 默认 Dialer 无超时上限）。
+	dialTimeout = 10 * time.Second
+	// dialKeepAlive TCP keepalive 探测周期。默认 Dialer 2h 才发首个探测——
+	// NAT 黑洞里 2h 足够连接半死且被复用。15s 周期让死连接在 15~30s 内被
+	// 内核掐掉（RST/ETIMEDOUT），复用侧立即感知而非卡到重传窗口。
+	dialKeepAlive = 15 * time.Second
+	// tlsHandshakeTimeout TLS 握手上限。现役此前完全缺失——握手挂起时无任何
+	// 层兜底（ResponseHeaderTimeout 只在请求写完后才计时），只能干等到
+	// HTTP.Client.Timeout（ChatHTTP 为 0 = 无兜底）。
+	tlsHandshakeTimeout = 10 * time.Second
+	// idleConnTimeout 空闲连接池保留时长。从 90s 收到 30s：WAF 风暴后上游
+	// NGI 常态性掐闲置连接，90s 池里的连接多半已死；复用侧仍有 15s keepalive
+	// 兜底识别。
+	idleConnTimeout = 30 * time.Second
+)
+
+// newDialer 构造出站拨号器（DialContext 的 Timeout/KeepAlive 参数集中于此，
+// 供测试回读断言）。
+func newDialer() *net.Dialer {
+	return &net.Dialer{
+		Timeout:   dialTimeout,
+		KeepAlive: dialKeepAlive,
+	}
+}
+
+// newTransport 构造共享出站 Transport（HTTP 与 ChatHTTP 同一实例，连接池不重复）。
+// 分两层防半死连接：
+//   - TLS 层：空 TLSNextProto 真正禁 h2（上游二次修正的实证：ForceAttemptHTTP2=false
+//     只对自定义 Dial 生效，默认 TLS 经 ALPN 仍协商出 h2，半死 h2 流复用表现为
+//     "http2: timeout awaiting response headers"——唯一正确写法是置空映射，让 ALPN
+//     完成后无 h2 协议可用，连接退回 HTTP/1.1）。
+//   - TCP 层：DialContext 10s 建连上限 + 15s keepalive 探测，半开连接在建立期
+//     和复用期都能被快速识别（见 dialTimeout/dialKeepAlive 注释）。
+//
+// 与上游的差异：本地保留 Proxy: http.ProxyFromEnvironment（main.go 的 clearProxyEnv
+// 直连优先策略依赖该字段）；ResponseHeaderTimeout 保持本地 120s 默认（config
+// upstream.header_timeout_seconds 接线点不变，main.go 无条件覆盖）。
+func newTransport() *http.Transport {
+	dialer := newDialer()
+	return &http.Transport{
+		Proxy:       http.ProxyFromEnvironment,
+		DialContext: dialer.DialContext,
+		// 空 TLSNextProto（非 nil）真正禁 h2：见函数注释。必须 make 而非 nil——
+		// nil 表示「让标准库注入默认 h2 映射」。
+		TLSNextProto:          make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+		TLSHandshakeTimeout:   tlsHandshakeTimeout,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       idleConnTimeout,
+		ResponseHeaderTimeout: 120 * time.Second, // main.go 按 config upstream.header_timeout_seconds 无条件覆盖
+	}
+}
+
+// closeIdler 实现该接口的 RoundTripper 支持清空空闲连接池（*http.Transport、
+// http2.Transport 等均满足；测试注入的自定义 RoundTripper 可选择性实现）。
+type closeIdler interface {
+	CloseIdleConnections()
+}
+
+// roundTripCloseIdle 在传输层请求失败后清掉 rt 所属 Transport 的空闲连接池
+// （上游 3d9a4cc 第 4 件：失败连接可能仍留在空闲池里，等 IdleConnTimeout 才
+// 过期，下一个请求会继续捡到它）。
+//
+// 挂载点：错误分类（Classify）只见业务信封——传输层失败根本没有 body 可分类
+// （见 ChatStreamContext 对 Do 错误的处理：不进 Classify、不罚号）。这类失败的
+// 正确处理正是连接层的池清理，故挂在与 Do 并列的传输层出口（ChatStreamContext
+// 的 Do 错误分支），而非 applyErrorPolicy。
+//
+// 关闭是 best-effort：rt 为 nil 或未实现 closeIdler（如测试注入的 rtFunc）时
+// 静默跳过。CloseIdleConnections 只关空闲连接，不影响在途请求；瞬时代价是
+// 下个请求多一次 TCP+TLS 握手，与半死连接被复用卡首字节的风险完全不成比例。
+func roundTripCloseIdle(rt http.RoundTripper) {
+	if rt == nil {
+		return
+	}
+	if ci, ok := rt.(closeIdler); ok {
+		ci.CloseIdleConnections()
+	}
+}
+
 // New 生产默认值。配置连接池减少 TLS 握手。
 func New() *Client {
-	tr := &http.Transport{
-		Proxy:               http.ProxyFromEnvironment,
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-		// 聊天 SSE 首字节前硬上限（对短 RPC 无实际影响：其总时长 120s 更先到期）。
-		ResponseHeaderTimeout: 120 * time.Second,
-	}
+	tr := newTransport()
 	return &Client{
 		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
@@ -1016,6 +1214,9 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		if err != nil {
 			cancel()
 			log.Printf("ERR: [upstream] chat_stream uid=%s: transport error on %s: %v", logfmt.UID8(a.UID), path, err)
+			// 失败连接可能仍留在空闲池里（等 IdleConnTimeout 才过期），
+			// 下一个请求会继续捡到它——best-effort 清空空闲池（上游 3d9a4cc）。
+			roundTripCloseIdle(c.chatHTTP().Transport)
 			if attempt < len(c.chatPaths(a))-1 {
 				continue
 			}
@@ -1297,7 +1498,7 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 		return nil, err
 	}
 	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
@@ -1377,7 +1578,7 @@ func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
 	// CommonHeaders 三段式 CLI UA 实测可通过 /v3/config 的 UA 门禁
 	// （Bearer + web UA → 400 code 12403，见 global-models-missing.md）。
 	c.CommonHeaders(req, a)
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err

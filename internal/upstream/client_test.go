@@ -62,11 +62,34 @@ func TestClassify(t *testing.T) {
 		// 换子码（不带顶层 11133 数字）：靠 extError.code 通道命中。
 		{400, `{"extError":{"code":"model_param_invalid","message":"the request parameters were rejected by the model provider"}}`, ErrBadParams},
 		{400, `{"extError":{"code":"integer_below_min_value"}}`, ErrBadParams},
-		// 11115「prompt is too long」：输入+历史超模型上下文上限。同属客户端侧参数问题
-		// （重试无用，须精简内容/新建任务），2026-10-01 收录——此前落 ErrClient →
-		// 出口谎报 503 no_healthy_account。上游自带中文 displayMsg/displayTips。
-		{400, `{"code":11115,"msg":"prompt is too long: 1054548 tokens > 1048576 maximum","extError":{"code":"invalid_request_error"}}`, ErrBadParams},
-		{400, `prompt is too long: 900000 tokens > 800000 maximum`, ErrBadParams},
+		// 11115「prompt is too long」：输入+历史超模型上下文上限。请求级错误
+		// （重试无用，须精简内容/新建任务）。2026-10-01 收录（当时归 ErrBadParams）；
+		// 上游 5f26ce3 拆出独立 ErrPromptTooLong（不罚号不轮转 + 语义化末端错误码）。
+		{400, `{"code":11115,"msg":"prompt is too long: 1054548 tokens > 1048576 maximum","extError":{"code":"invalid_request_error"}}`, ErrPromptTooLong},
+		{400, `prompt is too long: 900000 tokens > 800000 maximum`, ErrPromptTooLong},
+		{413, `{"code":11115,"msg":"prompt is too long"}`, ErrPromptTooLong},
+		// 429/5xx 状态码语义（限流/服务端故障）优先于 11115 文案：不走 prompt_too_long 层。
+		{429, `{"code":11115,"msg":"prompt is too long"}`, ErrSoftRate},
+		{500, `{"code":11115,"msg":"prompt is too long"}`, ErrServer},
+		// 14018：429 + 明确积分耗尽业务码 → 硬冷却（先于通用 429 兜底，上游 issue #175）。
+		// 只认结构化 code；无该 code 的 "credits exhausted" 文案仍走 429 软限流。
+		{429, `{"code":14018,"msg":"Credits exhausted"}`, ErrHardCredit},
+		{429, `{"error":{"data":{"code":14018,"msg":"Credits exhausted"}}}`, ErrHardCredit},
+		{429, `credits exhausted`, ErrSoftRate},
+		// 429 + quota 措辞（跨计费/限流两界）：状态码权威，归软限流而非硬冷却
+		// （上游 fork-scan-absorb T-3：此前 hardRule 先判会硬冷却到次日 04:00 白扔号 12h）。
+		{429, `{"code":9999,"msg":"quota exceeded"}`, ErrSoftRate},
+		{429, `{"code":9999,"msg":"额度不足"}`, ErrSoftRate},
+		// 非 429 的 quota 措辞仍归硬冷却（历史语义不变，issue #28 取舍保持）。
+		{403, `{"code":9999,"msg":"quota exceeded"}`, ErrHardCredit},
+		// 429 + 账号级故障文案：accountFault 层保持在 429 之上（等不来自愈）。
+		{429, `{"error":{"data":{"code":14017,"msg":"trial not activated"}}}`, ErrAccountFault},
+		// 11135 图片格式/数据无效（400）：请求级 fail-fast（含 JSON 空白形态）。
+		{400, `{"code":11135,"msg":"Invalid image_url content"}`, ErrImageInvalid},
+		{400, `{"code": 11135, "msg":"Invalid image_url content"}`, ErrImageInvalid},
+		{400, `{"msg":"invalid_image_data, please replace the image"}`, ErrImageInvalid},
+		// 403 + 11135 不在图片层（只认 400）：带信封的 403 由上方各层分类。
+		{403, `{"code":11135,"msg":"Invalid image_url content"}`, ErrClient},
 		{200, `quota exceeded`, ErrHardCredit},
 		// 账号级授权/配额故障（与 429 一起纳入轮换）：11140 request illegal = auth_forbidden
 		// 风控（需重登），14017 = quota_not_activated（试用未激活，需完成 register）。修复前

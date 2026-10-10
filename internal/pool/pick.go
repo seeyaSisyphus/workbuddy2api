@@ -41,9 +41,11 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
-	// 惰性清理过期的 6004 模型级冷却（map 不无限膨胀；status 只读遍历跳过过期项）。
+	// 惰性清理过期的 6004 模型级冷却与成本台账（两者的 map 都不无限膨胀；
+	// status 只读遍历天然跳过过期项，但内存条目必须在此真正删除，上游 dcc4918）。
 	for _, e := range p.byUID {
 		e.pruneExpiredModelCooldowns(now)
+		e.pruneExpiredModelCosts(now)
 	}
 	realmOK := func(e *entry) bool { return realm == "" || e.a.Realm() == realm }
 	healthyOf := func(e *entry) bool { return realmOK(e) && e.healthy(now) }
@@ -338,6 +340,12 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	}
 	log.Printf("WARN: [pool] fallback_earliest_expiry uid=%s until=%s kind=%s", logfmt.UID8(best.a.UID), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
 	best.lastUsed = time.Now()
+	// 兜底选中同样推进 usedSeq/pickSeq（上游 49930b2）：entry.usedSeq 的契约是
+	// 「每次被选中时取 pickSeq 自增值」，兜底也是选中；漏推进会让刚被兜底用过的
+	// 账号 usedSeq 恒 0，在 pick 的 LRU 兜底（按 usedSeq 取最旧）眼里仍是最旧，
+	// 被立刻重选——防集中/防惊群失效，且与本函数已更新 lastUsed 的事实自相矛盾。
+	p.pickSeq++
+	best.usedSeq = p.pickSeq
 	return best.a
 }
 

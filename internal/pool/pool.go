@@ -15,6 +15,11 @@ type Pool struct {
 	byUID   map[string]*entry
 	stateFp string
 	dirty   atomic.Bool // 内存有变更待落盘
+	// localStateUsable 本地 state.json 是否可用（New 的 load() 成功读取+解析）。
+	// RestoreFromSnapshot 择新恢复用：文件**存在但损坏**时与"文件缺失"同待遇——
+	// 本地没有可"优先"的状态，采用 Redis 快照（评审修复：旧判据只看 os.Stat，
+	// 损坏文件仍走"本地较新"分支把快照丢弃，全池运行态清零）。
+	localStateUsable atomic.Bool
 	// store 池状态快照镜像（redisstore.Store）；nil = 无需镜像（未配置 Redis / Noop 之外也可能 nil）。
 	// SaveState/LoadState 经它接线，与本地 state.json 并存作启动恢复备份。
 	store StoreSnapshotter
@@ -200,11 +205,17 @@ func (p *Pool) SetLowCreditProbeFunc(fn func(uid string)) {
 func (p *Pool) Acquire(uid string) bool {
 	p.mu.RLock()
 	e, ok := p.byUID[uid]
-	limit := p.inFlightLimit(e)
-	p.mu.RUnlock()
 	if !ok {
+		// 判空必须先于 inFlightLimit 快照：inFlightLimit 在分档启用时会解引用
+		// e.a.Realm()，uid 不在池内时 e 为 nil 直接 panic（上游 94e4e61）。
+		// 触发面：会话粘性路由对刚被移除/禁用（如 token 失效）的账号仍持 uid
+		// 调 Acquire；max_in_flight_global>0（本机生产配置）即走解引用分支。
+		// 与 Release 的判空顺序对齐（既有安全写法）。
+		p.mu.RUnlock()
 		return false
 	}
+	limit := p.inFlightLimit(e)
+	p.mu.RUnlock()
 	if limit <= 0 {
 		// 不限：计数仍累加（供状态观测），但永不拒绝。
 		e.inFlight.Add(1)
@@ -258,12 +269,27 @@ func (p *Pool) Add(a *auth.Auth) {
 // SyncToDir 用最新扫描结果对齐池：新账号加入、消失的账号剔除（状态保留）。
 // 剔除结果持久化回 state.json，避免已删账号在下次启动时被 load() 复活。
 func (p *Pool) SyncToDir(auths []*auth.Auth) {
+	p.syncToDirLocked(auths, true)
+}
+
+// UpsertOnly 只做新增/更新、**不做删除**（auths 热加载的半写安全闸用，见 watch.go）：
+// 目录里有文件读失败/解析失败时，加载结果不能证明"缺席账号已被删除"（可能只是
+// 半写/瞬时不可读），此时只把能解析的账号并入池，删除留给下一轮零跳过时判定。
+func (p *Pool) UpsertOnly(auths []*auth.Auth) {
+	p.syncToDirLocked(auths, false)
+}
+
+// syncToDirLocked 对齐池的统一实现；prune=false 时跳过"缺席剔除"。
+func (p *Pool) syncToDirLocked(auths []*auth.Auth, prune bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	seen := make(map[string]bool, len(auths))
 	for _, a := range auths {
 		seen[a.UID] = true
 		p.upsertLocked(a)
+	}
+	if !prune {
+		return
 	}
 	changed := false
 	for uid := range p.byUID {

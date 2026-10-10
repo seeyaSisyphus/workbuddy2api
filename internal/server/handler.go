@@ -532,15 +532,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 提取与下方会话头族的聚合键共用同一结果，故**不受粘性开关影响**：粘性未启用
 	// （Session==nil）时聚合键仍应是会话级，而不是退化成轮级。
 	sessKey := session.ExtractKey(body)
+	// stickyKey 是**粘性专用**键，与 sessKey（会话头族聚合用）分开（上游 8058019）：
+	// sessKey 为空时（OpenAI 兼容客户端——dsh / Codex 等既无 conversationId 也无
+	// metadata）用首条 user 消息派生会话级 fallback 键，使粘性仍能生效。
+	// 不能直接改 sessKey：那会连带改变会话头族轮级复合键（sessKey 入键）的聚合
+	// 语义，属于另一条链路的契约。
+	stickyKey := sessKey
+	if stickyKey == "" {
+		stickyKey = session.StickyFallbackKey(body)
+	}
 	stickyUID := ""
-	if h.cfg.Session != nil && sessKey != "" {
+	if h.cfg.Session != nil && stickyKey != "" {
 		// 传给 ResolveForModel 的是**完整**模型名（peek.Model，含 realm 前缀）。
 		// 粘性命中校验走 injected AvailableForModel 闭包 → 闭包内部 resolveModel 剥前缀
 		// 得 realm+bare，再按 realm 过滤可用集合。若传已剥前缀的 bareModel，闭包对裸名
 		// 恒剥出 realm=cn，跨 realm 粘性会话会被错误钉回 CN 集合；完整前缀才能让
 		// 闭包正确过滤到 global 集合（见 cmd/server/wiring.go realmAwareAvailableForModel）。
 		// 模型名也参与成本账本与选号过滤，不能用 "-" 占位污染模型键。
-		if uid, ok := h.cfg.Session.ResolveForModel(sessKey, peek.Model); ok {
+		if uid, ok := h.cfg.Session.ResolveForModel(stickyKey, peek.Model); ok {
 			stickyUID = uid
 		}
 	}
@@ -572,7 +581,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 幂等：stickyUID 已空则空操作；不会误解绑其他轮的绑定。仅当 Session != nil 时 stickyUID 才会非空。
 	unbindSticky := func() {
 		if stickyUID != "" {
-			h.cfg.Session.Unbind(sessKey)
+			h.cfg.Session.Unbind(stickyKey)
 			stickyUID = ""
 		}
 	}
@@ -756,6 +765,31 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusBadRequest
 				return
 			}
+			// 11115「prompt is too long」：立即透传上游原文回客户端，**不罚号不轮转**
+			// ——上下文超限是请求的问题（同一 body 换任何号都超限，白扔健康号配额）。
+			// applyErrorPolicy ErrPromptTooLong 分支零动作（不冷却/不熔断/不 NoteError），
+			// fail 只释放租约。error-passthrough：message 装上游 body 原文
+			// （code/msg/requestId 原样，含真实 token 数与上限值）。
+			if kind == upstream.ErrPromptTooLong {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				writeOpenAIError(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)))
+				st.status = http.StatusBadRequest
+				return
+			}
+			// 图片格式/数据无效：立即透传上游原文回客户端，不罚号不轮转。
+			// 同一 body 换账号仍是同样的解析结果，轮转只会放大无效请求。
+			if kind == upstream.ErrImageInvalid {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					msg = "image request was rejected by upstream"
+				}
+				writeOpenAIError(w, http.StatusBadRequest, "image_invalid", msg)
+				st.status = http.StatusBadRequest
+				return
+			}
 			// 请求参数被上游拒绝（11101 解析失败 / 11133 model_param_invalid）：**不轮转**。
 			//
 			// 依据（2026-10-01 实测）：body 在进循环前一次性构造，循环内唯一按账号变化的
@@ -791,21 +825,33 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
-		if sessKey != "" && h.cfg.Session != nil {
-			h.cfg.Session.Bind(sessKey, acct.UID)
+		if stickyKey != "" && h.cfg.Session != nil {
+			h.cfg.Session.Bind(stickyKey, acct.UID)
 		}
 		if peek.Stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
 			stats := newChatStatsReaderSince(rc, st.start)
-			_ = upstream.Stream(w, stats, h.cfg.Upstream.ReasoningAlias)
+			sErr := upstream.Stream(w, stats, h.cfg.Upstream.ReasoningAlias)
 			st.ttfb = stats.TTFB()
-			st.toks, _ = stats.Tokens()
+			// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），
+			// 不写入零值——否则「没观测到 usage」被伪造成「测得 0 token」，
+			// 与非流式走 completionTokens 返回 -1 的口径不一致（上游 b1f7bc8）。
+			toks, hasUsage := stats.Tokens()
+			if hasUsage {
+				st.toks = toks
+			}
+			if upstream.IsEmptyStreamError(sErr) {
+				// 上游 200 但无有效 SSE 帧：HTTP 头已发出（只能 200），但日志/状态
+				// 收敛到 upstream_parse 同语义，便于排障（上游 0a86854）。
+				st.status = http.StatusBadGateway
+				log.Printf("WARN: [server] empty upstream stream uid=%s model=%s (no valid SSE events)", logfmt.UID8(acct.UID), bareModel)
+			}
 			// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价，
 			// 供下次选号把免费/便宜的号排在前面。
 			if credit, ok := stats.Credit(); ok {
 				h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, stats.TotalTokens())
-			} else if _, hasUsage := stats.Tokens(); hasUsage {
+			} else if hasUsage {
 				// R9(c) 防护观测：usage 存在但 credit 缺失（如 global SSE 末帧未带 credit）。
 				// 不算合法成本观测（缺失≠0），仅记一条 WARN 协助排障，绝不写入账本。
 				log.Printf("WARN: [server] stream usage without credit uid=%s model=%s (no cost observation)", logfmt.UID8(acct.UID), bareModel)
@@ -884,6 +930,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusNotFound
 			code = "model_not_found"
 			msg = "model is not available on this gateway, check the model name"
+		case upstream.ErrPromptTooLong:
+			// 11115：请求级错误（上下文超限），已在轮转循环内 fail-fast 透传返回；
+			// 本分支只为文档完备（若未来路径变化走到末端，语义化错误码而非 503）。
+			status = http.StatusBadRequest
+			code = "prompt_too_long"
+			msg = "prompt is too long"
+		case upstream.ErrImageInvalid:
+			// 11135 等图片格式/数据无效：请求级错误，同样已在循环内 fail-fast。
+			status = http.StatusBadRequest
+			code = "image_invalid"
+			msg = "image request was rejected by upstream"
 		}
 		if s := strings.TrimSpace(ue.Msg); s != "" {
 			// 上游原文优先：透传 code/msg/requestId，不拼接本地前缀。
@@ -931,8 +988,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	//     但实测客户端会对它反复重试（2026-10-01 16:58 / 17:26 同一 requestId 在客户端
 	//     出现两次、每次白烧 3 次换号轮换），不下闸门就会演变成上游风暴。闸门需连续 5 次
 	//     才开，正常客户端看到首个 400 即停，不会误伤。
+	//   - ErrPromptTooLong / ErrImageInvalid（同为客户端必重试的 400，评审补充）：与
+	//     ErrBadParams 同类——请求级确定性错误，客户端失败后反复重试的形态相同，
+	//     同纳入闸门（此两 kind 已在轮转循环内 fail-fast 返回，不会白烧上游轮换，
+	//     但闸门挡的是客户端重试风暴本身）。
 	//   - 其余（全冷却 hintOK&&waitHint>0、无非禁用号 !hintOK）同为持久性不可用 → 升级。
-	if retryable || (ue != nil && ue.Kind == upstream.ErrBadParams) {
+	if retryable || (ue != nil && (ue.Kind == upstream.ErrBadParams ||
+		ue.Kind == upstream.ErrPromptTooLong || ue.Kind == upstream.ErrImageInvalid)) {
 		transientSlotPressure := st.uid == "" && hintOK && waitHint == 0
 		if !transientSlotPressure {
 			h.gate.noteFail(gateKey, time.Now(), waitHint)
@@ -940,6 +1002,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	writeOpenAIError(w, status, code, msg)
 	st.status = status
+}
+
+// promptTooLongMessage 11115 末端消息：上游原文优先（error-passthrough），
+// 空 body 时回落可读分类文案（不编造原文）。
+func promptTooLongMessage(body string) string {
+	if strings.TrimSpace(body) == "" {
+		return "prompt is too long"
+	}
+	return body
 }
 
 // rotateBackoff 轮转间指数退避 + 抖动（WAF 403 修复 P0-2，报告 §6）：
@@ -1065,6 +1136,14 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 内容策略拦截：内容问题非账号问题，不罚账号（无冷却/熔断/NoteError）。
 		// passthrough 首遇由 chatCompletions 内降级重试处理；最终仍拦则回 400
 		// content_blocked（防火墙文案），不再轮转、不暴露账号/冷却/错误码。
+	case upstream.ErrPromptTooLong:
+		// 11115「prompt is too long」：请求的问题不是账号的问题（同一 body 换任何
+		// 号都超限）。零动作（不冷却/不熔断/不 NoteError，同 ErrContentBlocked
+		// 待遇），chatCompletions 已直接透传原文返回不轮转——该分支只为文档完备，
+		// 不指望走到换号路径。
+	case upstream.ErrImageInvalid:
+		// 图片格式/数据无效：请求的问题不是账号的问题（同一 body 换任何号都会
+		// 得到相同解析错误）。零动作，chatCompletions 已 fail-fast 透传。
 	case upstream.ErrBadParams:
 		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）或模型拒绝请求参数
 		// （11133 model_param_invalid）：发给上游的 body 有问题（网关截断已由 413 消灭，
